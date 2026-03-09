@@ -276,6 +276,75 @@ def get_active_workers(campaign: str, prize: str) -> list[dict]:
     return workers
 
 
+# === チームメンバー管理 ===
+
+def _members_ref(campaign: str):
+    """メンバーコレクション参照"""
+    return _db().collection("campaigns").document(campaign).collection("members")
+
+
+def get_team_members(campaign: str) -> list[str]:
+    """チームメンバー一覧を取得（名前順）"""
+    docs = _members_ref(campaign).order_by("name").stream()
+    members = [doc.to_dict().get("name", "") for doc in docs]
+    return members
+
+
+def add_team_member(campaign: str, name: str):
+    """メンバー追加"""
+    name = name.strip()
+    if not name:
+        return
+    # 重複チェック
+    existing = get_team_members(campaign)
+    if name in existing:
+        return
+    _members_ref(campaign).add({"name": name, "created_at": _now()})
+
+
+def remove_team_member(campaign: str, name: str):
+    """メンバー削除"""
+    docs = _members_ref(campaign).where("name", "==", name).stream()
+    for doc in docs:
+        doc.reference.delete()
+
+
+def init_team_members(campaign: str, default_members: list[str]):
+    """メンバーが未登録なら初期メンバーを登録"""
+    existing = get_team_members(campaign)
+    if existing:
+        return existing
+    for name in default_members:
+        add_team_member(campaign, name)
+    return default_members
+
+
+# === 担当者別統計 ===
+
+def get_worker_stats(campaign: str, prize: str) -> dict[str, int]:
+    """賞ごとの担当者別完了件数"""
+    entries = get_entries(campaign, prize)
+    stats = {}
+    for e in entries:
+        completed_by = e.get("completed_by")
+        if completed_by and e.get("human_input_done"):
+            stats[completed_by] = stats.get(completed_by, 0) + 1
+    return stats
+
+
+def get_all_worker_stats(campaign: str) -> dict[str, dict[str, int]]:
+    """全賞横断の担当者別統計 {member: {prize: count}}"""
+    from config import PRIZES
+    result = {}
+    for prize_id in PRIZES:
+        prize_stats = get_worker_stats(campaign, prize_id)
+        for member, count in prize_stats.items():
+            if member not in result:
+                result[member] = {}
+            result[member][prize_id] = count
+    return result
+
+
 # === Firebase Storage (画像) ===
 
 def upload_image(

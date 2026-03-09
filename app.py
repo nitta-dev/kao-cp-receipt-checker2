@@ -28,6 +28,11 @@ from firebase_client import (
     get_active_workers,
     get_image_url,
     download_image_bytes,
+    get_team_members,
+    add_team_member,
+    remove_team_member,
+    init_team_members,
+    get_all_worker_stats,
 )
 
 # ==== ページ設定 ====
@@ -298,7 +303,8 @@ def _get_validation_warnings(form_data: dict) -> list[str]:
 
 
 def _save_entry_to_firestore(
-    campaign: str, prize: str, entry_id: str, form_data: dict
+    campaign: str, prize: str, entry_id: str, form_data: dict,
+    user: str = "",
 ):
     """フォームデータをFirestoreに保存"""
     data = {
@@ -326,6 +332,7 @@ def _save_entry_to_firestore(
             "unknown_items": form_data["unknown_items"],
             "cp_total": form_data["cp_total"],
         },
+        "completed_by": user,
         # ロック解放
         "assigned_to": None,
         "assigned_at": None,
@@ -357,19 +364,37 @@ def main():
         st.info("FIREBASE_CREDENTIALS 環境変数を設定してください。")
         st.stop()
 
-    # 担当者選択
-    user = st.sidebar.selectbox(
-        "👤 担当者",
-        TEAM_MEMBERS,
-        key="current_user",
-    )
-
     # キャンペーン
     campaign = st.sidebar.text_input(
         "🏷️ キャンペーンID",
         value=DEFAULT_CAMPAIGN_ID,
         key="campaign_id",
     )
+
+    # チームメンバーをFirestoreから取得（初回は config.py のデフォルトで初期化）
+    members = init_team_members(campaign, TEAM_MEMBERS)
+
+    # 担当者選択
+    user = st.sidebar.selectbox(
+        "👤 担当者",
+        members,
+        key="current_user",
+    )
+
+    # メンバー管理
+    with st.sidebar.expander("👥 メンバー管理"):
+        # 追加
+        new_member = st.text_input("新しいメンバー名", key="new_member_input")
+        if st.button("追加", key="add_member_btn") and new_member.strip():
+            add_team_member(campaign, new_member.strip())
+            st.rerun()
+
+        # 削除
+        if members:
+            del_member = st.selectbox("削除するメンバー", members, key="del_member_select")
+            if st.button("削除", key="del_member_btn"):
+                remove_team_member(campaign, del_member)
+                st.rerun()
 
     # 賞選択
     prize_id = st.sidebar.selectbox(
@@ -472,6 +497,38 @@ def page_dashboard(campaign: str):
             )
     else:
         st.caption("現在作業中のメンバーはいません。")
+
+    # 担当者別作業件数
+    st.divider()
+    st.subheader("📈 担当者別 作業件数")
+
+    worker_stats = get_all_worker_stats(campaign)
+    if worker_stats:
+        # 賞IDリスト（データがある賞のみ）
+        active_prizes = sorted(set(
+            pid for member_stats in worker_stats.values()
+            for pid in member_stats
+        ))
+
+        ws_rows = []
+        for member, prize_counts in sorted(worker_stats.items()):
+            row = {"担当者": member}
+            total = 0
+            for pid in active_prizes:
+                count = prize_counts.get(pid, 0)
+                row[f"{pid}賞"] = count
+                total += count
+            row["合計"] = total
+            ws_rows.append(row)
+
+        ws_df = pd.DataFrame(ws_rows)
+        st.dataframe(ws_df, use_container_width=True, hide_index=True)
+
+        # 棒グラフ
+        chart_df = ws_df.set_index("担当者")[["合計"]]
+        st.bar_chart(chart_df)
+    else:
+        st.caption("まだ作業実績がありません。")
 
     st.divider()
 
@@ -599,7 +656,7 @@ def page_receipt_input(campaign: str, prize_id: str, user: str):
         _render_auto_confirmed(auto_confirmed)
 
     with tab_done:
-        _render_human_done(campaign, prize_id, human_done)
+        _render_human_done(campaign, prize_id, human_done, user)
 
     with tab_all:
         _render_all_entries(entries)
@@ -703,7 +760,7 @@ def _render_needs_input(
                 st.session_state[confirm_key] = warnings
                 st.rerun()
             else:
-                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                 st.cache_data.clear()
                 # 次のエントリを取得
                 next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
@@ -718,7 +775,7 @@ def _render_needs_input(
             with col_yes:
                 if st.button("✅ はい、このまま保存", key=f"confirm_yes_{entry_id}"):
                     del st.session_state[confirm_key]
-                    _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                    _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                     st.cache_data.clear()
                     next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
                     st.session_state["current_entry"] = next_entry
@@ -804,7 +861,7 @@ def _render_auto_confirmed(entries: list[dict]):
         st.info(f"→ {eligibility}")
 
 
-def _render_human_done(campaign: str, prize_id: str, entries: list[dict]):
+def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: str = ""):
     """入力済みエントリの閲覧・編集"""
     if not entries:
         st.info("入力済みエントリはありません。")
@@ -872,7 +929,7 @@ def _render_human_done(campaign: str, prize_id: str, entries: list[dict]):
                         st.session_state[edit_confirm_key] = warnings
                         st.rerun()
                     else:
-                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                         st.cache_data.clear()
                         _cleanup_edit_state(entry_id, edit_key)
                         st.rerun()
@@ -893,7 +950,7 @@ def _render_human_done(campaign: str, prize_id: str, entries: list[dict]):
                 with col_yes:
                     if st.button("✅ はい、このまま保存", key=f"edit_confirm_yes_{entry_id}"):
                         del st.session_state[edit_confirm_key]
-                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                         st.cache_data.clear()
                         _cleanup_edit_state(entry_id, edit_key)
                         st.rerun()
