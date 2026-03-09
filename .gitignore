@@ -8,8 +8,7 @@ build/
 venv/
 
 # Secrets & credentials
-*.json
-!data/*.json
+.secrets/
 serviceAccountKey*.json
 *secret*.json
 token*.json
