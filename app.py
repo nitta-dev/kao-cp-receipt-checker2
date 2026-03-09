@@ -1,0 +1,987 @@
+"""
+花王CP レシートチェックv2 - Streamlit UI
+Firebase Firestore/Storage対応 + マルチユーザー排他制御
+"""
+import io
+from pathlib import Path
+
+import streamlit as st
+from PIL import Image, ImageOps
+
+from config import (
+    CONFIDENCE_THRESHOLD,
+    STORE_GROUPS,
+    PRIZES,
+    TEAM_MEMBERS,
+    DEFAULT_CAMPAIGN_ID,
+    check_eligibility,
+)
+from firebase_client import (
+    init_firebase,
+    get_entries,
+    update_entry,
+    get_prize_stats,
+    get_all_prize_stats,
+    claim_entry,
+    release_entry,
+    get_next_unclaimed_entry,
+    get_active_workers,
+    get_image_url,
+    download_image_bytes,
+)
+
+# ==== ページ設定 ====
+st.set_page_config(page_title="花王CP レシートチェックv2", layout="wide")
+
+
+# === 画像表示ヘルパー ===
+
+def render_receipt_image_from_url(storage_path: str, rotation: int = 0):
+    """Storage画像をURL経由で表示（回転対応）"""
+    if not storage_path:
+        st.warning("画像パスが設定されていません")
+        return
+
+    if rotation:
+        # 回転が必要な場合はダウンロードしてPILで回転
+        try:
+            img_bytes = download_image_bytes(storage_path)
+            img = Image.open(io.BytesIO(img_bytes))
+            img = ImageOps.exif_transpose(img)
+            img = img.rotate(-rotation, expand=True)
+            st.image(img, use_container_width=True)
+        except Exception as e:
+            st.error(f"画像読み込みエラー: {e}")
+    else:
+        try:
+            url = _get_cached_image_url(storage_path)
+            st.image(url, use_container_width=True)
+        except Exception:
+            # 署名URL失敗時はダウンロード表示
+            try:
+                img_bytes = download_image_bytes(storage_path)
+                st.image(img_bytes, use_container_width=True)
+            except Exception as e:
+                st.error(f"画像読み込みエラー: {e}")
+
+
+@st.cache_data(ttl=3000)  # 50分キャッシュ（URLは60分有効）
+def _get_cached_image_url(storage_path: str) -> str:
+    return get_image_url(storage_path)
+
+
+def render_receipt_image_local(image_path: str, rotation: int = 0):
+    """ローカル画像表示（後方互換）"""
+    path = Path(image_path)
+    if not path.exists():
+        st.warning(f"画像が見つかりません: {image_path}")
+        return
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)
+    if rotation:
+        img = img.rotate(-rotation, expand=True)
+    st.image(img, use_container_width=True)
+
+
+def render_receipt_image(entry: dict, rotation: int = 0):
+    """エントリに応じて適切な画像表示方法を選択"""
+    storage_path = entry.get("storage_path")
+    image_path = entry.get("image_path", "")
+
+    if storage_path:
+        render_receipt_image_from_url(storage_path, rotation)
+    elif image_path and Path(image_path).exists():
+        render_receipt_image_local(image_path, rotation)
+    else:
+        st.warning(f"画像が見つかりません: {image_path or storage_path}")
+
+
+def get_eligibility_display(cp_total: int) -> str:
+    """CP合計額からどの賞に資格があるか表示文字列を生成"""
+    results = []
+    for pid in ["S", "A", "B", "C"]:
+        prize = PRIZES[pid]
+        if cp_total >= prize["min_amount"]:
+            results.append(f"{pid}賞")
+    if results:
+        return f"資格あり({', '.join(results)})"
+    return "資格なし"
+
+
+def extract_filename_number(entry: dict) -> int:
+    """エントリからファイル番号を取得"""
+    if "file_number" in entry:
+        return entry["file_number"]
+    name = Path(entry.get("image_path", "")).name
+    if "(" in name and ")" in name:
+        try:
+            return int(name.split("(")[1].split(")")[0])
+        except (ValueError, IndexError):
+            pass
+    return 9999
+
+
+# ============================================================
+# 共通: 入力フォーム描画 & 保存処理
+# ============================================================
+def _render_entry_form(entry: dict, entry_id: str, key_prefix: str = "") -> dict:
+    """共通入力フォームを描画し、現在の入力値を返す"""
+    p = key_prefix
+
+    # 店舗情報
+    store_chain = st.text_input(
+        "🏪 店舗チェーン名",
+        value=entry.get("human_store_name", ""),
+        placeholder="例: ツルハドラッグ",
+        key=f"{p}store_chain_{entry_id}",
+    )
+    store_branch = st.text_input(
+        "🏪 店舗名（支店）",
+        value=entry.get("human_store_branch", ""),
+        placeholder="例: 勝田店",
+        key=f"{p}store_branch_{entry_id}",
+    )
+    purchase_date = st.text_input(
+        "📅 購入日時",
+        value=entry.get("human_purchase_date", ""),
+        placeholder="YYYY-MM-DD HH:MM",
+        key=f"{p}purchase_date_{entry_id}",
+    )
+
+    st.divider()
+
+    # === CP対象品 ===
+    st.markdown("#### 🎯 CP対象品")
+    cp_count_key = f"{p}cp_count_{entry_id}"
+    if cp_count_key not in st.session_state:
+        existing_cp = entry.get("human_cp_items", [])
+        st.session_state[cp_count_key] = max(len(existing_cp) if existing_cp else 0, 1)
+
+    cp_items = []
+    for i in range(st.session_state[cp_count_key]):
+        existing = (entry.get("human_cp_items") or [{}])[i] if i < len(entry.get("human_cp_items") or []) else {}
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            name = st.text_input(
+                f"CP{i+1} 商品名",
+                value=existing.get("name", ""),
+                key=f"{p}cp_name_{entry_id}_{i}",
+                placeholder="商品名",
+            )
+        with c2:
+            price = st.number_input(
+                f"CP{i+1} 金額",
+                min_value=0,
+                value=existing.get("price", 0),
+                step=1,
+                key=f"{p}cp_price_{entry_id}_{i}",
+            )
+        if name:
+            cp_items.append({"name": name, "price": price})
+
+    if st.button("+ CP対象行を追加", key=f"{p}add_cp_{entry_id}"):
+        st.session_state[cp_count_key] += 1
+        st.rerun()
+
+    cp_total = sum(item["price"] for item in cp_items)
+    st.metric("CP対象合計", f"¥{cp_total:,}")
+
+    st.divider()
+
+    # === 花王その他 ===
+    st.markdown("#### 🔵 その他花王製品")
+    kao_count_key = f"{p}kao_count_{entry_id}"
+    if kao_count_key not in st.session_state:
+        existing_kao = entry.get("human_kao_items", [])
+        st.session_state[kao_count_key] = max(len(existing_kao) if existing_kao else 0, 1)
+
+    kao_items = []
+    for i in range(st.session_state[kao_count_key]):
+        existing = (entry.get("human_kao_items") or [{}])[i] if i < len(entry.get("human_kao_items") or []) else {}
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            name = st.text_input(
+                f"花王{i+1} 商品名",
+                value=existing.get("name", ""),
+                key=f"{p}kao_name_{entry_id}_{i}",
+                placeholder="商品名",
+            )
+        with c2:
+            price = st.number_input(
+                f"花王{i+1} 金額",
+                min_value=0,
+                value=existing.get("price", 0),
+                step=1,
+                key=f"{p}kao_price_{entry_id}_{i}",
+            )
+        if name:
+            kao_items.append({"name": name, "price": price})
+
+    if st.button("+ 花王その他行を追加", key=f"{p}add_kao_{entry_id}"):
+        st.session_state[kao_count_key] += 1
+        st.rerun()
+
+    st.divider()
+
+    # === 判断つかず ===
+    st.markdown("#### ❓ 判断つかず")
+    unk_count_key = f"{p}unk_count_{entry_id}"
+    if unk_count_key not in st.session_state:
+        existing_unk = entry.get("human_unknown_items", [])
+        st.session_state[unk_count_key] = max(len(existing_unk) if existing_unk else 0, 1)
+
+    unknown_items = []
+    for i in range(st.session_state[unk_count_key]):
+        existing = (entry.get("human_unknown_items") or [{}])[i] if i < len(entry.get("human_unknown_items") or []) else {}
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            name = st.text_input(
+                f"不明{i+1} 商品名",
+                value=existing.get("name", ""),
+                key=f"{p}unk_name_{entry_id}_{i}",
+                placeholder="フリーテキスト",
+            )
+        with c2:
+            price = st.number_input(
+                f"不明{i+1} 金額",
+                min_value=0,
+                value=existing.get("price", 0),
+                step=1,
+                key=f"{p}unk_price_{entry_id}_{i}",
+            )
+        if name:
+            unknown_items.append({"name": name, "price": price})
+
+    if st.button("+ 判断つかず行を追加", key=f"{p}add_unk_{entry_id}"):
+        st.session_state[unk_count_key] += 1
+        st.rerun()
+
+    st.divider()
+
+    # レシート読み取り不可
+    unreadable = st.checkbox(
+        "📛 レシートが読み取れない",
+        value=entry.get("unreadable", False),
+        key=f"{p}unreadable_{entry_id}",
+    )
+
+    return {
+        "store_chain": store_chain,
+        "store_branch": store_branch,
+        "purchase_date": purchase_date,
+        "cp_items": cp_items,
+        "kao_items": kao_items,
+        "unknown_items": unknown_items,
+        "cp_total": cp_total,
+        "unreadable": unreadable,
+    }
+
+
+def _get_validation_warnings(form_data: dict) -> list[str]:
+    """入力データのバリデーション"""
+    if form_data["unreadable"]:
+        return []
+
+    warnings = []
+    missing = []
+    if not form_data["store_chain"].strip():
+        missing.append("店舗名")
+    if not form_data["purchase_date"].strip():
+        missing.append("日付")
+    if missing:
+        warnings.append(f"⚠️ {' と '.join(missing)}が入っていないですが、あっていますか？")
+
+    if not form_data["cp_items"]:
+        warnings.append("⚠️ CP対象商品欄が空ですが、あっていますか？")
+
+    return warnings
+
+
+def _save_entry_to_firestore(
+    campaign: str, prize: str, entry_id: str, form_data: dict
+):
+    """フォームデータをFirestoreに保存"""
+    data = {
+        "human_input_done": True,
+        "is_auto": False,
+        "human_store_name": form_data["store_chain"],
+        "human_store_branch": form_data["store_branch"],
+        "human_purchase_date": form_data["purchase_date"],
+        "human_cp_items": form_data["cp_items"],
+        "human_kao_items": form_data["kao_items"],
+        "human_unknown_items": form_data["unknown_items"],
+        "human_cp_total": form_data["cp_total"],
+        "unreadable": form_data["unreadable"],
+        "confirmed_store_name": form_data["store_chain"],
+        "confirmed_store_branch": form_data["store_branch"],
+        "confirmed_purchase_date": form_data["purchase_date"],
+        "confirmed_cp_target_total": form_data["cp_total"],
+        "confirmed_items": form_data["cp_items"] + form_data["kao_items"],
+        "human_input": {
+            "store_name": form_data["store_chain"],
+            "store_branch": form_data["store_branch"],
+            "purchase_date": form_data["purchase_date"],
+            "cp_items": form_data["cp_items"],
+            "kao_items": form_data["kao_items"],
+            "unknown_items": form_data["unknown_items"],
+            "cp_total": form_data["cp_total"],
+        },
+        # ロック解放
+        "assigned_to": None,
+        "assigned_at": None,
+    }
+    update_entry(campaign, prize, entry_id, data)
+
+
+def _cleanup_edit_state(entry_id: str, edit_key: str):
+    """編集モード終了時にsession_stateをクリア"""
+    st.session_state[edit_key] = False
+    for k in list(st.session_state.keys()):
+        if k.startswith("edit_") and k.endswith(f"_{entry_id}"):
+            del st.session_state[k]
+        elif k.startswith("edit_") and f"_{entry_id}_" in k:
+            del st.session_state[k]
+
+
+# ============================================================
+# メイン画面
+# ============================================================
+def main():
+    st.sidebar.title("花王CP レシートチェックv2")
+
+    # Firebase初期化
+    try:
+        init_firebase()
+    except Exception as e:
+        st.error(f"Firebase接続エラー: {e}")
+        st.info("FIREBASE_CREDENTIALS 環境変数を設定してください。")
+        st.stop()
+
+    # 担当者選択
+    user = st.sidebar.selectbox(
+        "👤 担当者",
+        TEAM_MEMBERS,
+        key="current_user",
+    )
+
+    # キャンペーン
+    campaign = st.sidebar.text_input(
+        "🏷️ キャンペーンID",
+        value=DEFAULT_CAMPAIGN_ID,
+        key="campaign_id",
+    )
+
+    # 賞選択
+    prize_id = st.sidebar.selectbox(
+        "🏆 対象賞",
+        list(PRIZES.keys()),
+        index=list(PRIZES.keys()).index("B"),
+        format_func=lambda pid: f"{pid}: {PRIZES[pid]['name']}",
+        key="prize_select",
+    )
+    prize = PRIZES[prize_id]
+    st.sidebar.caption(f"最低金額: ¥{prize['min_amount']:,}")
+
+    # モード切替
+    mode = st.sidebar.radio(
+        "モード",
+        ["📝 レシート入力", "📊 ダッシュボード"],
+        key="mode_select",
+    )
+
+    # 店舗グループ参照
+    with st.sidebar.expander("📋 店舗グループ一覧"):
+        for group_id, stores in STORE_GROUPS.items():
+            group_label = "ツルハグループ" if group_id == "tsuruha" else "ウエルシアグループ"
+            st.markdown(f"**{group_label}**")
+            st.markdown(", ".join(stores[:5]) + "...")
+
+    with st.sidebar.expander("🏆 賞一覧"):
+        for pid, p in PRIZES.items():
+            st.markdown(f"**{pid}**: {p['name']} ({p['min_amount']:,}円〜)")
+
+    if mode == "📝 レシート入力":
+        page_receipt_input(campaign, prize_id, user)
+    elif mode == "📊 ダッシュボード":
+        page_dashboard(campaign)
+
+
+# ============================================================
+# ダッシュボード（全賞横断）
+# ============================================================
+def page_dashboard(campaign: str):
+    st.title("📊 ダッシュボード")
+
+    try:
+        all_stats = get_all_prize_stats(campaign)
+    except Exception as e:
+        st.error(f"データ取得エラー: {e}")
+        return
+
+    # 全賞サマリーテーブル
+    import pandas as pd
+
+    rows = []
+    total_all = 0
+    done_all = 0
+    for pid, stats in all_stats.items():
+        if stats["total"] == 0:
+            continue
+        rows.append({
+            "賞": f"{pid}: {PRIZES[pid]['name'][:20]}",
+            "全件": stats["total"],
+            "AI自動": stats["auto"],
+            "要手入力": stats["needs_input"],
+            "入力済": stats["human_done"],
+            "進捗": f"{stats['progress']:.0%}",
+        })
+        total_all += stats["total"]
+        done_all += stats["done"]
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # 全体進捗
+        overall = done_all / total_all if total_all > 0 else 0
+        st.progress(overall)
+        st.caption(f"全体進捗: {done_all}/{total_all} ({overall:.0%})")
+    else:
+        st.info(f"キャンペーン '{campaign}' にデータがありません。")
+        return
+
+    st.divider()
+
+    # 作業中メンバー
+    st.subheader("👥 作業中メンバー")
+    all_workers = []
+    for pid in PRIZES:
+        try:
+            workers = get_active_workers(campaign, pid)
+            for w in workers:
+                w["prize"] = pid
+            all_workers.extend(workers)
+        except Exception:
+            pass
+
+    if all_workers:
+        for w in all_workers:
+            st.markdown(
+                f"- **{w['user']}** → {w['prize']}賞 #{w['file_number']} "
+                f"（{w['minutes_ago']}分前）"
+            )
+    else:
+        st.caption("現在作業中のメンバーはいません。")
+
+    st.divider()
+
+    # 賞別詳細
+    st.subheader("🏆 賞別詳細")
+    detail_prize = st.selectbox(
+        "賞を選択",
+        [pid for pid, s in all_stats.items() if s["total"] > 0],
+        format_func=lambda pid: f"{pid}: {PRIZES[pid]['name']}",
+        key="dashboard_prize_detail",
+    )
+
+    if detail_prize:
+        _render_prize_detail(campaign, detail_prize, all_stats[detail_prize])
+
+
+def _render_prize_detail(campaign: str, prize_id: str, stats: dict):
+    """賞別の詳細統計"""
+    prize = PRIZES[prize_id]
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("総件数", stats["total"])
+    col2.metric("自動確定", stats["auto"])
+    col3.metric("要手入力(残)", stats["needs_input"])
+    col4.metric("入力完了", stats["human_done"])
+
+    ready = stats["needs_input"] == 0
+    if ready:
+        st.success("✅ 全件確認完了！ 抽選に進めます。")
+    else:
+        st.warning(f"⚠️ 残り {stats['needs_input']} 件の手入力が必要です。")
+
+    # 資格判定
+    st.divider()
+    st.subheader(f"🏆 {prize_id}賞 資格判定")
+    st.caption(
+        f"条件: CP対象合計 ¥{prize['min_amount']:,} 以上"
+        + (f" / {prize.get('store_group', '')}グループ限定" if prize.get("store_group") else "")
+    )
+
+    entries = get_entries(campaign, prize_id)
+    eligible_count = 0
+    ineligible_count = 0
+    unreadable_count = 0
+    pending_count = 0
+
+    for e in entries:
+        if not (e.get("is_auto") or e.get("human_input_done")):
+            pending_count += 1
+            continue
+        if e.get("unreadable"):
+            unreadable_count += 1
+            continue
+        cp_total = _get_entry_cp_total(e)
+        store = _get_entry_store(e)
+        ok, _ = check_eligibility(cp_total, store, prize_id)
+        if ok:
+            eligible_count += 1
+        else:
+            ineligible_count += 1
+
+    col_e1, col_e2, col_e3, col_e4 = st.columns(4)
+    col_e1.metric("✅ 資格あり", eligible_count)
+    col_e2.metric("❌ 資格なし", ineligible_count)
+    col_e3.metric("📛 読取不可", unreadable_count)
+    col_e4.metric("⏳ 未確認", pending_count)
+
+    st.caption(
+        f"当選枠: {prize['winners']}名 / 予備: {prize['reserve']}名 "
+        f"→ 資格あり {eligible_count}名 から抽選"
+    )
+
+
+def _get_entry_cp_total(entry: dict) -> int:
+    if entry.get("is_auto") and not entry.get("human_input_done"):
+        return entry.get("cp_target_total", 0)
+    elif entry.get("human_input_done"):
+        return entry.get("human_cp_total", 0)
+    return 0
+
+
+def _get_entry_store(entry: dict) -> str:
+    if entry.get("is_auto") and not entry.get("human_input_done"):
+        return entry.get("store_name", "")
+    elif entry.get("human_input_done"):
+        return entry.get("human_store_name", "")
+    return ""
+
+
+# ============================================================
+# レシート入力画面
+# ============================================================
+def page_receipt_input(campaign: str, prize_id: str, user: str):
+    entries = _get_cached_entries(campaign, prize_id)
+
+    if not entries:
+        st.info(f"データがありません: campaigns/{campaign}/prizes/{prize_id}")
+        return
+
+    # エントリ分類
+    needs_input = []
+    auto_confirmed = []
+    human_done = []
+
+    for e in entries:
+        if e.get("is_auto") and not e.get("human_input_done"):
+            auto_confirmed.append(e)
+        elif e.get("human_input_done"):
+            human_done.append(e)
+        else:
+            needs_input.append(e)
+
+    # フィルタタブ
+    tab_input, tab_auto, tab_done, tab_all = st.tabs([
+        f"要手入力 ({len(needs_input)})",
+        f"自動確定 ({len(auto_confirmed)})",
+        f"入力済み ({len(human_done)})",
+        f"全件 ({len(entries)})",
+    ])
+
+    with tab_input:
+        _render_needs_input(campaign, prize_id, user, needs_input, len(human_done))
+
+    with tab_auto:
+        _render_auto_confirmed(auto_confirmed)
+
+    with tab_done:
+        _render_human_done(campaign, prize_id, human_done)
+
+    with tab_all:
+        _render_all_entries(entries)
+
+
+@st.cache_data(ttl=10)
+def _get_cached_entries(campaign: str, prize_id: str) -> list[dict]:
+    return get_entries(campaign, prize_id)
+
+
+def _render_needs_input(
+    campaign: str, prize_id: str, user: str,
+    needs_input: list[dict], done_count: int,
+):
+    """要手入力エントリの入力"""
+    if not needs_input:
+        st.success("全件入力完了！ 抽選に進めます。")
+        return
+
+    # 進捗バー
+    total_manual = len(needs_input) + done_count
+    progress = done_count / total_manual if total_manual > 0 else 0
+    st.progress(progress)
+    st.caption(f"手入力進捗: {done_count}/{total_manual} ({progress:.0%})")
+
+    # 次のエントリを取得（排他制御付き）
+    if st.button("🔄 次のエントリを取得", type="primary", key="get_next"):
+        st.cache_data.clear()
+        entry = get_next_unclaimed_entry(campaign, prize_id, user)
+        if entry:
+            st.session_state["current_entry"] = entry
+        else:
+            st.info("入力可能なエントリがありません（全て他のメンバーが作業中か完了済みです）。")
+
+    # 現在のエントリ表示
+    current = st.session_state.get("current_entry")
+    if current is None:
+        # 自動的に次のエントリを取得
+        current = get_next_unclaimed_entry(campaign, prize_id, user)
+        if current:
+            st.session_state["current_entry"] = current
+
+    if current is None:
+        st.info("入力可能なエントリがありません。")
+        return
+
+    entry_id = current["_id"]
+    filename = current.get("original_filename", Path(current.get("image_path", "")).name)
+    file_num = extract_filename_number(current)
+    conf = current.get("confidence", 0)
+    error = current.get("error")
+
+    st.markdown(f"### 📝 #{file_num} {filename}")
+    if error:
+        st.error(f"📛 OCRエラー — {error}")
+    elif conf is not None:
+        st.warning(f"⚠️ 信頼度 {conf:.2f} (閾値 {CONFIDENCE_THRESHOLD} 未満)")
+
+    st.caption(f"担当: {user} | エントリID: {entry_id}")
+
+    # 左右分割
+    col_img, col_form = st.columns([1, 1])
+
+    with col_img:
+        st.subheader("📷 レシート画像")
+        rotation_key = f"rotation_{entry_id}"
+        if rotation_key not in st.session_state:
+            st.session_state[rotation_key] = 0
+
+        btn_cols = st.columns(3)
+        with btn_cols[0]:
+            if st.button("⬅ 左回転", key=f"rot_l_{entry_id}"):
+                st.session_state[rotation_key] = (st.session_state[rotation_key] - 90) % 360
+        with btn_cols[1]:
+            if st.button("🔄 リセット", key=f"rot_r_{entry_id}"):
+                st.session_state[rotation_key] = 0
+        with btn_cols[2]:
+            if st.button("➡ 右回転", key=f"rot_rr_{entry_id}"):
+                st.session_state[rotation_key] = (st.session_state[rotation_key] + 90) % 360
+
+        render_receipt_image(current, st.session_state[rotation_key])
+
+    with col_form:
+        st.subheader("📝 データ入力")
+        st.caption("※ AIの読み取り結果は表示しません。レシート画像を見て入力してください。")
+
+        form_data = _render_entry_form(current, entry_id)
+
+        confirm_key = f"confirm_save_{entry_id}"
+
+        if st.button(
+            "💾 保存して次へ →",
+            type="primary",
+            use_container_width=True,
+            key=f"save_{entry_id}",
+        ):
+            st.session_state.pop(confirm_key, None)
+
+            warnings = _get_validation_warnings(form_data)
+            if warnings:
+                st.session_state[confirm_key] = warnings
+                st.rerun()
+            else:
+                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                st.cache_data.clear()
+                # 次のエントリを取得
+                next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
+                st.session_state["current_entry"] = next_entry
+                st.rerun()
+
+        # バリデーション確認ダイアログ
+        if confirm_key in st.session_state:
+            for w in st.session_state[confirm_key]:
+                st.warning(w)
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("✅ はい、このまま保存", key=f"confirm_yes_{entry_id}"):
+                    del st.session_state[confirm_key]
+                    _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                    st.cache_data.clear()
+                    next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
+                    st.session_state["current_entry"] = next_entry
+                    st.rerun()
+            with col_no:
+                if st.button("↩ いいえ、戻る", key=f"confirm_no_{entry_id}"):
+                    del st.session_state[confirm_key]
+                    st.rerun()
+
+        # スキップボタン
+        if st.button("⏭ スキップ（後で戻る）", key=f"skip_{entry_id}"):
+            release_entry(campaign, prize_id, entry_id)
+            st.cache_data.clear()
+            next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
+            st.session_state["current_entry"] = next_entry
+            st.rerun()
+
+
+def _render_auto_confirmed(entries: list[dict]):
+    """自動確定エントリの閲覧"""
+    if not entries:
+        st.info("自動確定エントリはありません。")
+        return
+
+    st.caption(f"信頼度 {CONFIDENCE_THRESHOLD} 以上のエントリ（閲覧のみ）")
+
+    entries_sorted = sorted(entries, key=extract_filename_number)
+
+    options = [
+        f"#{extract_filename_number(e)} {e.get('original_filename', Path(e.get('image_path', '')).name)} "
+        f"(conf: {e.get('confidence', 0):.2f})"
+        for e in entries_sorted
+    ]
+    selected = st.selectbox("エントリ選択", options, key="auto_select")
+    if selected is None:
+        return
+
+    sel_idx = options.index(selected)
+    entry = entries_sorted[sel_idx]
+
+    col_img, col_data = st.columns([1, 1])
+
+    with col_img:
+        st.subheader("📷 レシート画像")
+        render_receipt_image(entry)
+
+    with col_data:
+        st.subheader("📋 AI読み取り結果")
+        conf = entry.get("confidence", 0)
+        st.success(f"✅ 信頼度: {conf:.2f} (AI自動確定)")
+
+        st.markdown(f"**店舗**: {entry.get('store_name', '不明')} {entry.get('store_branch', '')}")
+        st.markdown(f"**日時**: {entry.get('purchase_date', '不明')}")
+        st.markdown(f"**税区分**: {entry.get('tax_type', '不明')}")
+        if entry.get("tax_adjusted"):
+            st.caption("※ 税補正済")
+
+        st.divider()
+
+        cp_items = [item for item in entry.get("items", []) if item.get("is_cp_target")]
+        if cp_items:
+            st.markdown("**🎯 CP対象品:**")
+            for item in cp_items:
+                price = item.get("price", 0)
+                st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+            cp_total = entry.get("cp_target_total", 0)
+            st.markdown(f"  **CP合計: ¥{cp_total:,}**")
+        else:
+            st.markdown("**🎯 CP対象品:** （なし）")
+
+        kao_items = [
+            item for item in entry.get("items", [])
+            if item.get("is_kao") and not item.get("is_cp_target")
+        ]
+        if kao_items:
+            st.markdown("**🔵 その他花王製品:**")
+            for item in kao_items:
+                price = item.get("price", 0)
+                st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+
+        st.divider()
+        eligibility = get_eligibility_display(entry.get("cp_target_total", 0))
+        st.info(f"→ {eligibility}")
+
+
+def _render_human_done(campaign: str, prize_id: str, entries: list[dict]):
+    """入力済みエントリの閲覧・編集"""
+    if not entries:
+        st.info("入力済みエントリはありません。")
+        return
+
+    st.caption(f"人間入力完了分 ({len(entries)}件)")
+
+    options = [
+        f"#{extract_filename_number(e)} "
+        f"{e.get('original_filename', Path(e.get('image_path', '')).name)} "
+        f"— CP: ¥{e.get('human_cp_total', 0):,}"
+        for e in entries
+    ]
+    selected = st.selectbox("エントリ選択", options, key="done_select")
+    if selected is None:
+        return
+
+    sel_idx = options.index(selected)
+    entry = entries[sel_idx]
+    entry_id = entry["_id"]
+
+    edit_key = f"editing_{entry_id}"
+    is_editing = st.session_state.get(edit_key, False)
+
+    col_img, col_data = st.columns([1, 1])
+
+    with col_img:
+        st.subheader("📷 レシート画像")
+        rotation_key = f"done_rotation_{entry_id}"
+        if rotation_key not in st.session_state:
+            st.session_state[rotation_key] = 0
+
+        btn_cols = st.columns(3)
+        with btn_cols[0]:
+            if st.button("⬅ 左回転", key=f"done_rot_l_{entry_id}"):
+                st.session_state[rotation_key] = (st.session_state[rotation_key] - 90) % 360
+        with btn_cols[1]:
+            if st.button("🔄 リセット", key=f"done_rot_r_{entry_id}"):
+                st.session_state[rotation_key] = 0
+        with btn_cols[2]:
+            if st.button("➡ 右回転", key=f"done_rot_rr_{entry_id}"):
+                st.session_state[rotation_key] = (st.session_state[rotation_key] + 90) % 360
+
+        render_receipt_image(entry, st.session_state[rotation_key])
+
+    with col_data:
+        if is_editing:
+            st.subheader("✏️ データ編集")
+
+            form_data = _render_entry_form(entry, entry_id, key_prefix="edit_")
+
+            edit_confirm_key = f"edit_confirm_save_{entry_id}"
+
+            col_save, col_cancel = st.columns(2)
+            with col_save:
+                if st.button(
+                    "💾 保存",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"edit_save_{entry_id}",
+                ):
+                    st.session_state.pop(edit_confirm_key, None)
+                    warnings = _get_validation_warnings(form_data)
+                    if warnings:
+                        st.session_state[edit_confirm_key] = warnings
+                        st.rerun()
+                    else:
+                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                        st.cache_data.clear()
+                        _cleanup_edit_state(entry_id, edit_key)
+                        st.rerun()
+            with col_cancel:
+                if st.button(
+                    "❌ キャンセル",
+                    use_container_width=True,
+                    key=f"edit_cancel_{entry_id}",
+                ):
+                    st.session_state.pop(edit_confirm_key, None)
+                    _cleanup_edit_state(entry_id, edit_key)
+                    st.rerun()
+
+            if edit_confirm_key in st.session_state:
+                for w in st.session_state[edit_confirm_key]:
+                    st.warning(w)
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("✅ はい、このまま保存", key=f"edit_confirm_yes_{entry_id}"):
+                        del st.session_state[edit_confirm_key]
+                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data)
+                        st.cache_data.clear()
+                        _cleanup_edit_state(entry_id, edit_key)
+                        st.rerun()
+                with col_no:
+                    if st.button("↩ いいえ、戻る", key=f"edit_confirm_no_{entry_id}"):
+                        del st.session_state[edit_confirm_key]
+                        st.rerun()
+        else:
+            st.subheader("📋 入力データ")
+
+            if st.button("✏️ 編集する", key=f"edit_btn_{entry_id}"):
+                st.session_state[edit_key] = True
+                st.rerun()
+
+            if entry.get("unreadable"):
+                st.error("📛 レシート読み取り不可")
+            else:
+                st.markdown(
+                    f"**店舗**: {entry.get('human_store_name', '')} "
+                    f"{entry.get('human_store_branch', '')}"
+                )
+                st.markdown(f"**日時**: {entry.get('human_purchase_date', '')}")
+
+                cp_items = entry.get("human_cp_items", [])
+                if cp_items:
+                    st.markdown("**🎯 CP対象品:**")
+                    for item in cp_items:
+                        st.markdown(f"  - {item['name']}  ¥{item['price']:,}")
+                    st.markdown(f"  **CP合計: ¥{entry.get('human_cp_total', 0):,}**")
+
+                kao_items = entry.get("human_kao_items", [])
+                if kao_items:
+                    st.markdown("**🔵 その他花王:**")
+                    for item in kao_items:
+                        st.markdown(f"  - {item['name']}  ¥{item['price']:,}")
+
+                unknown_items = entry.get("human_unknown_items", [])
+                if unknown_items:
+                    st.markdown("**❓ 判断つかず:**")
+                    for item in unknown_items:
+                        st.markdown(f"  - {item['name']}  ¥{item['price']:,}")
+
+                st.divider()
+                eligibility = get_eligibility_display(entry.get("human_cp_total", 0))
+                st.info(f"→ {eligibility}")
+
+
+def _render_all_entries(entries: list[dict]):
+    """全件一覧表示"""
+    import pandas as pd
+
+    rows = []
+    for e in entries:
+        filename = e.get("original_filename", Path(e.get("image_path", "")).name)
+        conf = e.get("confidence", 0)
+        error = e.get("error")
+
+        if e.get("is_auto") and not e.get("human_input_done"):
+            status = "✅ 自動確定"
+            cp_total = e.get("cp_target_total", 0)
+            store = e.get("store_name", "")
+        elif e.get("human_input_done"):
+            status = "📝 入力済み"
+            cp_total = e.get("human_cp_total", 0)
+            store = e.get("human_store_name", "")
+        elif error:
+            status = "❌ エラー"
+            cp_total = 0
+            store = ""
+        else:
+            status = "⏳ 要手入力"
+            cp_total = 0
+            store = ""
+
+        assigned = e.get("assigned_to", "")
+        rows.append({
+            "#": extract_filename_number(e),
+            "ファイル名": filename,
+            "信頼度": f"{conf:.2f}" if conf and not error else ("ERR" if error else "-"),
+            "状態": status,
+            "店舗": store,
+            "CP合計": f"¥{cp_total:,}" if cp_total else "",
+            "担当": assigned or "",
+        })
+
+    df = pd.DataFrame(rows).sort_values("#")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+if __name__ == "__main__":
+    main()

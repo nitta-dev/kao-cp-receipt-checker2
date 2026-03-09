@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets & credentials
+*.json
+!data/*.json
+serviceAccountKey*.json
+*secret*.json
+token*.json
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Results (local only)
+results/
+
+# Images (local only, uploaded to Firebase Storage)
+data/receipt_images/

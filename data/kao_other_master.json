@@ -1,0 +1,102 @@
+{
+  "brands": [
+    {
+      "brand": "ビオレu",
+      "aliases": ["ビオレu", "ビオレU", "ビオレ ユー", "ビオレユー", "ビオレ泡ハンドソープ", "ビオレu泡ハンドソープ"],
+      "category": "body_care",
+      "note": "ザ ボディ/ザ ハンド以外のビオレuシリーズ"
+    },
+    {
+      "brand": "ビオレ",
+      "aliases": ["ビオレ", "Biore", "ビオレメイク落とし", "ビオレ洗顔", "ビオレUV", "ビオレさらさらパウダー", "ビオレ冷タオル", "ビオレガード"],
+      "category": "face_care",
+      "note": "ビオレ基本ライン（洗顔・UV等）"
+    },
+    {
+      "brand": "アタック",
+      "aliases": ["アタック", "アタックZERO", "アタックZEROOH", "アタックゼロ", "アタック抗菌EX", "アタック3X", "アタック高活性バイオEX", "ATTACK"],
+      "category": "laundry"
+    },
+    {
+      "brand": "メリット",
+      "aliases": ["メリット", "Merit", "メリットシャンプー", "メリットリンス", "メリットコンディショナー"],
+      "category": "hair_care"
+    },
+    {
+      "brand": "エッセンシャル",
+      "aliases": ["エッセンシャル", "Essential", "エッセンシャルflat", "エッセンシャルザビューティ", "エッセンシャルTB"],
+      "category": "hair_care"
+    },
+    {
+      "brand": "キュレル",
+      "aliases": ["キュレル", "Curel", "キュレル泡洗顔", "キュレルローション", "キュレル乳液", "キュレルクリーム"],
+      "category": "sensitive_care"
+    },
+    {
+      "brand": "サクセス",
+      "aliases": ["サクセス", "Success", "サクセスシャンプー", "サクセス育毛"],
+      "category": "mens_care"
+    },
+    {
+      "brand": "ハミング",
+      "aliases": ["ハミング", "ハミングFine", "ハミングファイン", "ハミング消臭実感"],
+      "category": "laundry"
+    },
+    {
+      "brand": "ハイター",
+      "aliases": ["ハイター", "キッチンハイター", "ワイドハイター", "ワイドハイターEX"],
+      "category": "household"
+    },
+    {
+      "brand": "マジックリン",
+      "aliases": ["マジックリン", "バスマジックリン", "キッチンマジックリン", "トイレマジックリン"],
+      "category": "household"
+    },
+    {
+      "brand": "クイックルワイパー",
+      "aliases": ["クイックル", "クイックルワイパー", "クイックルJoan"],
+      "category": "household"
+    },
+    {
+      "brand": "リセッシュ",
+      "aliases": ["リセッシュ", "リセッシュ除菌EX"],
+      "category": "household"
+    },
+    {
+      "brand": "めぐりズム",
+      "aliases": ["めぐりズム", "めぐりずむ", "蒸気でホットアイマスク", "蒸気でアイマスク"],
+      "category": "health"
+    },
+    {
+      "brand": "バブ",
+      "aliases": ["バブ", "バブメディキュア", "バブエピュール"],
+      "category": "bath"
+    },
+    {
+      "brand": "ニベア",
+      "aliases": ["ニベア", "NIVEA", "ニベアクリーム", "ニベアボディ"],
+      "category": "body_care",
+      "note": "花王グループ（日本販売）"
+    },
+    {
+      "brand": "ケープ",
+      "aliases": ["ケープ", "Cape", "ケープスーパーハード"],
+      "category": "hair_styling"
+    },
+    {
+      "brand": "リーゼ",
+      "aliases": ["リーゼ", "Liese", "リーゼ泡カラー"],
+      "category": "hair_styling"
+    },
+    {
+      "brand": "ロリエ",
+      "aliases": ["ロリエ", "Laurier"],
+      "category": "sanitary"
+    },
+    {
+      "brand": "ヘルシア",
+      "aliases": ["ヘルシア", "Healthya"],
+      "category": "food"
+    }
+  ]
+}
