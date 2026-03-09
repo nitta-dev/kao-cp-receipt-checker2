@@ -289,9 +289,9 @@ def _get_validation_warnings(form_data: dict) -> list[str]:
 
     warnings = []
     missing = []
-    if not form_data["store_chain"].strip():
+    if not (form_data["store_chain"] or "").strip():
         missing.append("店舗名")
-    if not form_data["purchase_date"].strip():
+    if not (form_data["purchase_date"] or "").strip():
         missing.append("日付")
     if missing:
         warnings.append(f"⚠️ {' と '.join(missing)}が入っていないですが、あっていますか？")
