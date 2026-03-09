@@ -145,6 +145,8 @@ def cmd_ocr(args):
         print(f"結果保存: {output}")
     else:
         # Firestoreモード: Storageから画像DL → OCR → Firestoreに結果登録
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
         from firebase_client import (
             init_firebase, get_entries, update_entry, download_image_bytes,
         )
@@ -161,40 +163,70 @@ def cmd_ocr(args):
             print("全てOCR処理済みです。")
             return
 
+        workers = getattr(args, "workers", 1)
+        print(f"並列数: {workers}")
+
         success = 0
         errors = 0
-        for i, entry in enumerate(targets, 1):
+        lock = threading.Lock()
+        completed = 0
+
+        def _ocr_one(entry, max_retries=3):
+            """1件のOCR処理（スレッドセーフ・リトライ付き）"""
+            import time as _time
             entry_id = entry["_id"]
             storage_path = entry.get("storage_path", "")
             filename = entry.get("original_filename", "?")
 
-            try:
-                img_bytes = download_image_bytes(storage_path)
-                result = ocr_single_from_bytes(img_bytes, filename)
+            for attempt in range(max_retries):
+                try:
+                    img_bytes = download_image_bytes(storage_path)
+                    result = ocr_single_from_bytes(img_bytes, filename)
 
-                update_data = {
-                    "confidence": result.get("confidence"),
-                    "is_auto": result.get("is_auto", False),
-                    "error": result.get("error"),
-                    "store_name": result.get("store_name"),
-                    "store_branch": result.get("store_branch"),
-                    "purchase_date": result.get("purchase_date"),
-                    "items": result.get("items", []),
-                    "tax_type": result.get("tax_type"),
-                    "tax_adjusted": result.get("tax_adjusted", False),
-                    "subtotal": result.get("subtotal"),
-                    "total": result.get("total"),
-                    "cp_target_total": result.get("cp_target_total", 0),
-                    "kao_other_total": result.get("kao_other_total", 0),
-                }
-                update_entry(args.campaign, args.prize, entry_id, update_data)
-                status = "AUTO" if result.get("is_auto") else "MANUAL"
-                print(f"  [{i}/{len(targets)}] {filename}: conf={result.get('confidence', 0):.2f} → {status}")
-                success += 1
-            except Exception as e:
-                update_entry(args.campaign, args.prize, entry_id, {"error": str(e)})
-                print(f"  [{i}/{len(targets)}] {filename}: ERROR - {e}")
-                errors += 1
+                    update_data = {
+                        "confidence": result.get("confidence"),
+                        "is_auto": result.get("is_auto", False),
+                        "error": result.get("error"),
+                        "store_name": result.get("store_name"),
+                        "store_branch": result.get("store_branch"),
+                        "purchase_date": result.get("purchase_date"),
+                        "items": result.get("items", []),
+                        "tax_type": result.get("tax_type"),
+                        "tax_adjusted": result.get("tax_adjusted", False),
+                        "subtotal": result.get("subtotal"),
+                        "total": result.get("total"),
+                        "cp_target_total": result.get("cp_target_total", 0),
+                        "kao_other_total": result.get("kao_other_total", 0),
+                    }
+                    update_entry(args.campaign, args.prize, entry_id, update_data)
+                    return ("ok", filename, result)
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt  # 1s, 2s, 4s
+                        _time.sleep(wait)
+                        continue
+                    try:
+                        update_entry(args.campaign, args.prize, entry_id, {"error": str(e)})
+                    except Exception:
+                        pass
+                    return ("error", filename, str(e))
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_ocr_one, entry): entry
+                for entry in targets
+            }
+            for future in as_completed(futures):
+                completed += 1
+                status_type, filename, data = future.result()
+                if status_type == "ok":
+                    conf = data.get("confidence", 0)
+                    label = "AUTO" if data.get("is_auto") else "MANUAL"
+                    print(f"  [{completed}/{len(targets)}] {filename}: conf={conf:.2f} -> {label}")
+                    success += 1
+                else:
+                    print(f"  [{completed}/{len(targets)}] {filename}: ERROR - {data}")
+                    errors += 1
 
         auto_count = sum(
             1 for e in get_entries(args.campaign, args.prize)
