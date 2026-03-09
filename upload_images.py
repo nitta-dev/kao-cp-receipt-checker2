@@ -43,7 +43,7 @@ def upload_single(
             "assigned_at": None,
         }
     except Exception as e:
-        print(f"  ❌ {local_path.name}: {e}")
+        print(f"  NG {local_path.name}: {e}")
         return None
 
 
@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--prize", required=True, help="賞ID (S/A/B/C/SP_TSURUHA/SP_WELCIA)")
     parser.add_argument("--workers", type=int, default=5, help="並列アップロード数")
     parser.add_argument("--dry-run", action="store_true", help="アップロードせず一覧表示のみ")
+    parser.add_argument("--images-only", action="store_true", help="画像のみアップロード（Firestoreエントリ作成をスキップ）")
     args = parser.parse_args()
 
     image_dir = Path(args.image_dir)
@@ -99,16 +100,19 @@ def main():
             result = future.result()
             if result:
                 entries.append(result)
-                print(f"  ✅ [{i}/{len(image_paths)}] {path.name}")
+                print(f"  OK [{i}/{len(image_paths)}] {path.name}")
             else:
                 failed += 1
 
     # file_number順にソート
     entries.sort(key=lambda e: e["file_number"])
 
-    # Firestoreに一括登録
-    print(f"\nFirestoreにエントリ登録中... ({len(entries)}件)")
-    create_entries_batch(args.campaign, args.prize, entries)
+    # Firestoreに一括登録（--images-onlyの場合はスキップ）
+    if args.images_only:
+        print(f"\n--images-only: Firestoreエントリ登録をスキップ")
+    else:
+        print(f"\nFirestoreにエントリ登録中... ({len(entries)}件)")
+        create_entries_batch(args.campaign, args.prize, entries)
 
     print(f"\n=== 完了 ===")
     print(f"成功: {len(entries)}件")
