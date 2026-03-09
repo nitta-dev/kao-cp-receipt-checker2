@@ -3,6 +3,7 @@
 Firebase Firestore/Storage対応 + マルチユーザー排他制御
 """
 import io
+from datetime import date, time, datetime
 from pathlib import Path
 
 import streamlit as st
@@ -146,12 +147,36 @@ def _render_entry_form(entry: dict, entry_id: str, key_prefix: str = "") -> dict
         placeholder="例: 勝田店",
         key=f"{p}store_branch_{entry_id}",
     )
-    purchase_date = st.text_input(
-        "📅 購入日時",
-        value=entry.get("human_purchase_date", ""),
-        placeholder="YYYY-MM-DD HH:MM",
-        key=f"{p}purchase_date_{entry_id}",
-    )
+    # 購入日時: カレンダー + 時刻ピッカー
+    existing_date_val = None
+    existing_time_val = time(0, 0)
+    existing_str = entry.get("human_purchase_date", "")
+    if existing_str:
+        try:
+            dt = datetime.strptime(existing_str.strip(), "%Y-%m-%d %H:%M")
+            existing_date_val = dt.date()
+            existing_time_val = dt.time()
+        except ValueError:
+            pass
+
+    col_date, col_time = st.columns([2, 1])
+    with col_date:
+        purchase_date_val = st.date_input(
+            "📅 購入日",
+            value=existing_date_val,
+            key=f"{p}purchase_date_{entry_id}",
+        )
+    with col_time:
+        purchase_time_val = st.time_input(
+            "🕐 時刻",
+            value=existing_time_val,
+            key=f"{p}purchase_time_{entry_id}",
+        )
+
+    if purchase_date_val:
+        purchase_date = f"{purchase_date_val.strftime('%Y-%m-%d')} {purchase_time_val.strftime('%H:%M')}"
+    else:
+        purchase_date = ""
 
     st.divider()
 
@@ -698,14 +723,18 @@ def _render_needs_input(
     st.progress(progress)
     st.caption(f"手入力進捗: {done_count}/{total_manual} ({progress:.0%})")
 
-    # 次のエントリを取得（排他制御付き）
-    if st.button("🔄 次のエントリを取得", type="primary", key="get_next"):
+    # 次のレシートを取得（排他制御付き）
+    if st.button("🔄 次のレシートへ", type="primary", key="get_next"):
+        # 現在のエントリのロックを解放してから次を取得
+        current_entry = st.session_state.get("current_entry")
+        if current_entry:
+            release_entry(campaign, prize_id, current_entry["_id"])
         st.cache_data.clear()
         entry = get_next_unclaimed_entry(campaign, prize_id, user)
         if entry:
             st.session_state["current_entry"] = entry
         else:
-            st.info("入力可能なエントリがありません（全て他のメンバーが作業中か完了済みです）。")
+            st.info("現在入力できるレシートがありません（他のメンバーが作業中か、すべて入力済みです）")
 
     # 現在のエントリ表示
     current = st.session_state.get("current_entry")
@@ -716,7 +745,7 @@ def _render_needs_input(
             st.session_state["current_entry"] = current
 
     if current is None:
-        st.info("入力可能なエントリがありません。")
+        st.info("現在入力できるレシートがありません（他のメンバーが作業中か、すべて入力済みです）")
         return
 
     entry_id = current["_id"]
@@ -727,9 +756,11 @@ def _render_needs_input(
 
     st.markdown(f"### 📝 #{file_num} {filename}")
     if error:
-        st.error(f"📛 OCRエラー — {error}")
+        st.warning("📛 AIがこのレシートを読み取れませんでした。レシート画像を見て入力してください。")
+        with st.expander("エラー詳細（管理者向け）"):
+            st.code(error)
     elif conf is not None:
-        st.warning(f"⚠️ 信頼度 {conf:.2f} (閾値 {CONFIDENCE_THRESHOLD} 未満)")
+        st.warning("⚠️ AIの読み取り精度が低いため、手入力をお願いします")
 
     # 同一file_numberの関連レシートを表示
     related = [e for e in needs_input if extract_filename_number(e) == file_num and e.get("_id") != entry_id]
@@ -817,7 +848,7 @@ def _render_needs_input(
         confirm_key = f"confirm_save_{entry_id}"
 
         if st.button(
-            "💾 保存して次へ →",
+            "💾 保存して次のレシートへ",
             type="primary",
             use_container_width=True,
             key=f"save_{entry_id}",
@@ -855,7 +886,7 @@ def _render_needs_input(
                     st.rerun()
 
         # スキップボタン
-        if st.button("⏭ スキップ（後で戻る）", key=f"skip_{entry_id}"):
+        if st.button("⏭ このレシートは後で入力する", key=f"skip_{entry_id}"):
             release_entry(campaign, prize_id, entry_id)
             st.cache_data.clear()
             next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
@@ -1033,20 +1064,34 @@ def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: 
         st.info("入力済みエントリはありません。")
         return
 
-    st.caption(f"人間入力完了分 ({len(entries)}件)")
+    # 対応者で絞り込み
+    workers = sorted(set(e.get("completed_by", "") for e in entries if e.get("completed_by")))
+    filter_options = ["すべて"] + workers
+    selected_worker = st.selectbox("対応者で絞り込み", filter_options, key="done_worker_filter")
+
+    if selected_worker != "すべて":
+        filtered = [e for e in entries if e.get("completed_by") == selected_worker]
+    else:
+        filtered = entries
+
+    st.caption(f"入力完了分 ({len(filtered)}件" + (f" / 全{len(entries)}件)" if selected_worker != "すべて" else ")"))
+
+    if not filtered:
+        st.info("該当するレシートがありません。")
+        return
 
     options = [
         f"#{extract_filename_number(e)} "
         f"{e.get('original_filename', Path(e.get('image_path', '')).name)} "
         f"— CP: ¥{e.get('human_cp_total', 0):,}"
-        for e in entries
+        for e in filtered
     ]
     selected = st.selectbox("エントリ選択", options, key="done_select")
     if selected is None:
         return
 
     sel_idx = options.index(selected)
-    entry = entries[sel_idx]
+    entry = filtered[sel_idx]
     entry_id = entry["_id"]
 
     edit_key = f"editing_{entry_id}"
