@@ -19,6 +19,7 @@ from config import (
     CSV_COLUMNS,
     DEFAULT_CAMPAIGN_ID,
     check_eligibility,
+    check_eligibility_group,
     identify_store_group,
 )
 
@@ -276,8 +277,17 @@ def cmd_split(args):
     print(f"  うち管理者チェック対象: {len(admin_check_indices)}件")
 
 
+def _get_file_number(entry: dict) -> int:
+    """エントリからfile_numberを取得"""
+    if "file_number" in entry:
+        return entry["file_number"]
+    return _extract_filename_number(
+        entry.get("original_filename", entry.get("image_path", ""))
+    )
+
+
 def cmd_lottery(args):
-    """抽選: エントリから賞ごとに当選者を抽出"""
+    """抽選: エントリから賞ごとに当選者を抽出（同一file_number合算対応）"""
     entries = _load_entries(args)
     prize_id = args.prize
     seed = args.seed
@@ -303,47 +313,84 @@ def cmd_lottery(args):
     random.seed(seed)
 
     prize = PRIZES[prize_id]
-    eligible = []
-    ineligible = []
 
+    # --- file_number単位でグループ化 ---
+    groups: dict[int, list[dict]] = {}
     for entry in entries:
-        if entry.get("unreadable"):
-            entry["lottery_result"] = "対象外"
-            ineligible.append({**entry, "reason": "レシート読み取り不可"})
+        fn = _get_file_number(entry)
+        groups.setdefault(fn, []).append(entry)
+
+    multi_receipt_count = sum(1 for g in groups.values() if len(g) > 1)
+    if multi_receipt_count > 0:
+        print(f"📎 複数レシート応募者: {multi_receipt_count}組")
+
+    eligible_groups = []   # (file_number, group_entries)
+    ineligible_entries = []  # flat list of individual entries with reason
+
+    for fn, group_entries in groups.items():
+        # 読み取り不可チェック: 全レシートが読み取り不可なら対象外
+        all_unreadable = all(e.get("unreadable") for e in group_entries)
+        if all_unreadable:
+            for e in group_entries:
+                e["lottery_result"] = "対象外"
+                ineligible_entries.append({**e, "reason": "レシート読み取り不可"})
             continue
 
-        if entry.get("error") and entry.get("unreadable"):
-            entry["lottery_result"] = "対象外"
-            ineligible.append({**entry, "reason": "OCRエラー・読み取り不可"})
-            continue
+        # 合算: 読み取り可能なエントリのCP合計を合算
+        cp_total = 0
+        store_groups_list = []
+        for e in group_entries:
+            if e.get("unreadable"):
+                continue
+            data = _get_entry_data(e)
+            cp_total += data["cp_total"]
+            store = data["store_name"]
+            store_groups_list.append(identify_store_group(store))
 
-        data = _get_entry_data(entry)
-        cp_total = data["cp_total"]
-        store = data["store_name"]
-        ok, reason = check_eligibility(cp_total, store, prize_id)
+        # 合算値を各エントリに記録（参照用）
+        for e in group_entries:
+            e["aggregated_cp_total"] = cp_total
+            e["receipt_count"] = len(group_entries)
+
+        # 資格判定（合算後の金額で判定）
+        ok, reason = check_eligibility_group(cp_total, store_groups_list, prize_id)
 
         if ok:
-            eligible.append(entry)
+            eligible_groups.append((fn, group_entries))
         else:
-            ineligible.append({**entry, "reason": reason})
+            for e in group_entries:
+                ineligible_entries.append({**e, "reason": reason})
 
-    random.shuffle(eligible)
+    # --- file_number単位で抽選（1人1エントリ） ---
+    random.shuffle(eligible_groups)
 
-    winners = eligible[:prize["winners"]]
-    reserves = eligible[prize["winners"]:prize["winners"] + prize["reserve"]]
-    losers = eligible[prize["winners"] + prize["reserve"]:]
+    winner_groups = eligible_groups[:prize["winners"]]
+    reserve_groups = eligible_groups[prize["winners"]:prize["winners"] + prize["reserve"]]
+    loser_groups = eligible_groups[prize["winners"] + prize["reserve"]:]
 
-    for entry in winners:
-        entry["lottery_result"] = "当選"
-    for entry in reserves:
-        entry["lottery_result"] = "予備当選"
-    for entry in losers:
-        entry["lottery_result"] = "落選"
-    for entry in ineligible:
-        if "lottery_result" not in entry:
-            entry["lottery_result"] = "対象外"
+    # 結果を各エントリに書き込む
+    for _, group_entries in winner_groups:
+        for e in group_entries:
+            e["lottery_result"] = "当選"
+    for _, group_entries in reserve_groups:
+        for e in group_entries:
+            e["lottery_result"] = "予備当選"
+    for _, group_entries in loser_groups:
+        for e in group_entries:
+            e["lottery_result"] = "落選"
+    for e in ineligible_entries:
+        if "lottery_result" not in e:
+            e["lottery_result"] = "対象外"
 
-    all_results = winners + reserves + losers + ineligible
+    # 全結果を平坦化
+    all_results = []
+    for _, group_entries in winner_groups:
+        all_results.extend(group_entries)
+    for _, group_entries in reserve_groups:
+        all_results.extend(group_entries)
+    for _, group_entries in loser_groups:
+        all_results.extend(group_entries)
+    all_results.extend(ineligible_entries)
 
     # 結果保存
     if getattr(args, "local", False) or not hasattr(args, "campaign"):
@@ -361,7 +408,11 @@ def cmd_lottery(args):
             if entry_id:
                 update_entry(
                     args.campaign, args.prize, entry_id,
-                    {"lottery_result": entry.get("lottery_result", "")}
+                    {
+                        "lottery_result": entry.get("lottery_result", ""),
+                        "aggregated_cp_total": entry.get("aggregated_cp_total"),
+                        "receipt_count": entry.get("receipt_count"),
+                    }
                 )
         # ローカルにもJSON出力
         output = Path(args.output)
@@ -373,11 +424,14 @@ def cmd_lottery(args):
         )
         print(f"Firestore更新完了 + ローカル保存: {output}")
 
+    eligible_count = len(eligible_groups)
     print(f"\n=== 抽選結果: {prize['name']} ===")
-    print(f"応募総数: {len(entries)}")
-    print(f"資格あり: {len(eligible)}")
-    print(f"当選: {len(winners)} / 予備: {len(reserves)} / 落選: {len(losers)}")
-    print(f"対象外: {len(ineligible)}")
+    print(f"応募総数: {len(entries)}件（{len(groups)}人）")
+    if multi_receipt_count > 0:
+        print(f"  うち複数レシート: {multi_receipt_count}組")
+    print(f"資格あり: {eligible_count}人")
+    print(f"当選: {len(winner_groups)} / 予備: {len(reserve_groups)} / 落選: {len(loser_groups)}")
+    print(f"対象外: {len(ineligible_entries)}件")
 
 
 def cmd_export(args):

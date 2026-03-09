@@ -547,6 +547,7 @@ def page_dashboard(campaign: str):
 
 def _render_prize_detail(campaign: str, prize_id: str, stats: dict):
     """賞別の詳細統計"""
+    from config import identify_store_group
     prize = PRIZES[prize_id]
 
     col1, col2, col3, col4 = st.columns(4)
@@ -554,6 +555,21 @@ def _render_prize_detail(campaign: str, prize_id: str, stats: dict):
     col2.metric("自動確定", stats["auto"])
     col3.metric("要手入力(残)", stats["needs_input"])
     col4.metric("入力完了", stats["human_done"])
+
+    # 複数レシート応募者の情報
+    entries = get_entries(campaign, prize_id)
+    fn_groups: dict[int, list] = {}
+    for e in entries:
+        fn = extract_filename_number(e)
+        fn_groups.setdefault(fn, []).append(e)
+    multi_receipt = {fn: g for fn, g in fn_groups.items() if len(g) > 1}
+    if multi_receipt:
+        st.info(f"📎 複数レシート応募者: {len(multi_receipt)}組（最大{max(len(g) for g in multi_receipt.values())}枚）")
+        with st.expander("複数レシートの詳細"):
+            for fn, group in sorted(multi_receipt.items()):
+                st.markdown(f"**#{fn}** — {len(group)}枚")
+    else:
+        st.caption(f"全{len(fn_groups)}人（複数レシート応募なし）")
 
     ready = stats["needs_input"] == 0
     if ready:
@@ -653,7 +669,7 @@ def page_receipt_input(campaign: str, prize_id: str, user: str):
         _render_needs_input(campaign, prize_id, user, needs_input, len(human_done))
 
     with tab_auto:
-        _render_auto_confirmed(auto_confirmed)
+        _render_auto_confirmed(auto_confirmed, campaign, prize_id, user)
 
     with tab_done:
         _render_human_done(campaign, prize_id, human_done, user)
@@ -715,6 +731,27 @@ def _render_needs_input(
     elif conf is not None:
         st.warning(f"⚠️ 信頼度 {conf:.2f} (閾値 {CONFIDENCE_THRESHOLD} 未満)")
 
+    # 同一file_numberの関連レシートを表示
+    related = [e for e in needs_input if extract_filename_number(e) == file_num and e.get("_id") != entry_id]
+    # 他タブの同一file_numberも検索
+    all_entries = _get_cached_entries(campaign, prize_id)
+    related_other = [
+        e for e in all_entries
+        if extract_filename_number(e) == file_num and e.get("_id") != entry_id
+    ]
+    if related_other:
+        st.info(f"📎 この応募者は{len(related_other) + 1}枚のレシートを提出しています")
+        with st.expander(f"関連レシート（{len(related_other)}枚）"):
+            for re_entry in related_other:
+                re_fname = re_entry.get("original_filename", "")
+                re_status = "✅自動確定" if re_entry.get("is_auto") and not re_entry.get("human_input_done") else (
+                    "📝入力済" if re_entry.get("human_input_done") else "⏳未入力"
+                )
+                re_cp = re_entry.get("cp_target_total", re_entry.get("human_cp_total", 0))
+                st.markdown(f"- {re_fname} [{re_status}] CP: ¥{re_cp:,}")
+                if re_entry.get("storage_path") or re_entry.get("image_path"):
+                    render_receipt_image(re_entry)
+
     st.caption(f"担当: {user} | エントリID: {entry_id}")
 
     # 左右分割
@@ -741,7 +778,39 @@ def _render_needs_input(
 
     with col_form:
         st.subheader("📝 データ入力")
-        st.caption("※ AIの読み取り結果は表示しません。レシート画像を見て入力してください。")
+
+        # OCR結果を参考表示（折りたたみ）
+        if current.get("items") and not current.get("error"):
+            with st.expander("🤖 AI読み取り結果（参考）"):
+                st.caption("⚠️ 信頼度が低いため人間確認が必要です。参考としてご利用ください。")
+                if current.get("store_name"):
+                    st.markdown(f"**店舗**: {current.get('store_name', '')} {current.get('store_branch', '')}")
+                if current.get("purchase_date"):
+                    st.markdown(f"**日時**: {current.get('purchase_date', '')}")
+
+                items = current.get("items", [])
+                cp_items_ref = [i for i in items if i.get("is_cp_target")]
+                kao_items_ref = [i for i in items if i.get("is_kao") and not i.get("is_cp_target")]
+                other_items_ref = [i for i in items if not i.get("is_kao") and i.get("price", 0) > 0]
+
+                if cp_items_ref:
+                    st.markdown("**🎯 CP対象品（AI判定）:**")
+                    for item in cp_items_ref:
+                        st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+
+                if kao_items_ref:
+                    st.markdown("**🔵 その他花王（AI判定）:**")
+                    for item in kao_items_ref:
+                        st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+
+                if other_items_ref:
+                    st.markdown("**📦 その他商品:**")
+                    for item in other_items_ref[:5]:
+                        st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                    if len(other_items_ref) > 5:
+                        st.caption(f"  ...他{len(other_items_ref) - 5}件")
+
+                st.markdown(f"**合計**: ¥{current.get('total', 0):,}")
 
         form_data = _render_entry_form(current, entry_id)
 
@@ -794,13 +863,13 @@ def _render_needs_input(
             st.rerun()
 
 
-def _render_auto_confirmed(entries: list[dict]):
-    """自動確定エントリの閲覧"""
+def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: str = "", user: str = ""):
+    """自動確定エントリの閲覧・修正"""
     if not entries:
         st.info("自動確定エントリはありません。")
         return
 
-    st.caption(f"信頼度 {CONFIDENCE_THRESHOLD} 以上のエントリ（閲覧のみ）")
+    st.caption(f"信頼度 {CONFIDENCE_THRESHOLD} 以上のエントリ（修正可能）")
 
     entries_sorted = sorted(entries, key=extract_filename_number)
 
@@ -815,50 +884,147 @@ def _render_auto_confirmed(entries: list[dict]):
 
     sel_idx = options.index(selected)
     entry = entries_sorted[sel_idx]
+    entry_id = entry.get("_id", "")
+
+    # 編集モード管理
+    edit_key = f"auto_editing_{entry_id}"
+    is_editing = st.session_state.get(edit_key, False)
 
     col_img, col_data = st.columns([1, 1])
 
     with col_img:
         st.subheader("📷 レシート画像")
-        render_receipt_image(entry)
+        rotation_key = f"auto_rotation_{entry_id}"
+        if rotation_key not in st.session_state:
+            st.session_state[rotation_key] = 0
+
+        btn_cols = st.columns(3)
+        with btn_cols[0]:
+            if st.button("⬅ 左回転", key=f"auto_rot_l_{entry_id}"):
+                st.session_state[rotation_key] = (st.session_state[rotation_key] - 90) % 360
+        with btn_cols[1]:
+            if st.button("🔄 リセット", key=f"auto_rot_r_{entry_id}"):
+                st.session_state[rotation_key] = 0
+        with btn_cols[2]:
+            if st.button("➡ 右回転", key=f"auto_rot_rr_{entry_id}"):
+                st.session_state[rotation_key] = (st.session_state[rotation_key] + 90) % 360
+
+        render_receipt_image(entry, st.session_state[rotation_key])
 
     with col_data:
-        st.subheader("📋 AI読み取り結果")
-        conf = entry.get("confidence", 0)
-        st.success(f"✅ 信頼度: {conf:.2f} (AI自動確定)")
+        if is_editing:
+            # --- 編集モード ---
+            st.subheader("✏️ AI自動確定の修正")
+            st.warning("⚠️ AI判定を人間が修正します。保存後は「入力済み」に移動します。")
 
-        st.markdown(f"**店舗**: {entry.get('store_name', '不明')} {entry.get('store_branch', '')}")
-        st.markdown(f"**日時**: {entry.get('purchase_date', '不明')}")
-        st.markdown(f"**税区分**: {entry.get('tax_type', '不明')}")
-        if entry.get("tax_adjusted"):
-            st.caption("※ 税補正済")
+            # OCR結果をプリセットとしてフォーム表示
+            # human_* がまだなければOCR結果をデフォルト値に
+            edit_entry = dict(entry)
+            if not edit_entry.get("human_store_name"):
+                edit_entry["human_store_name"] = entry.get("store_name", "")
+            if not edit_entry.get("human_store_branch"):
+                edit_entry["human_store_branch"] = entry.get("store_branch", "")
+            if not edit_entry.get("human_purchase_date"):
+                edit_entry["human_purchase_date"] = entry.get("purchase_date", "")
+            if not edit_entry.get("human_cp_items"):
+                edit_entry["human_cp_items"] = [
+                    item for item in entry.get("items", []) if item.get("is_cp_target")
+                ]
+            if not edit_entry.get("human_kao_items"):
+                edit_entry["human_kao_items"] = [
+                    item for item in entry.get("items", [])
+                    if item.get("is_kao") and not item.get("is_cp_target")
+                ]
 
-        st.divider()
+            form_data = _render_entry_form(edit_entry, entry_id, key_prefix="autoedit_")
 
-        cp_items = [item for item in entry.get("items", []) if item.get("is_cp_target")]
-        if cp_items:
-            st.markdown("**🎯 CP対象品:**")
-            for item in cp_items:
-                price = item.get("price", 0)
-                st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
-            cp_total = entry.get("cp_target_total", 0)
-            st.markdown(f"  **CP合計: ¥{cp_total:,}**")
+            edit_confirm_key = f"autoedit_confirm_save_{entry_id}"
+
+            col_save, col_cancel = st.columns(2)
+            with col_save:
+                if st.button(
+                    "💾 保存",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"autoedit_save_{entry_id}",
+                ):
+                    st.session_state.pop(edit_confirm_key, None)
+                    warnings = _get_validation_warnings(form_data)
+                    if warnings:
+                        st.session_state[edit_confirm_key] = warnings
+                        st.rerun()
+                    else:
+                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+                        st.cache_data.clear()
+                        _cleanup_edit_state(entry_id, edit_key)
+                        st.rerun()
+            with col_cancel:
+                if st.button(
+                    "❌ キャンセル",
+                    use_container_width=True,
+                    key=f"autoedit_cancel_{entry_id}",
+                ):
+                    st.session_state.pop(edit_confirm_key, None)
+                    _cleanup_edit_state(entry_id, edit_key)
+                    st.rerun()
+
+            if edit_confirm_key in st.session_state:
+                for w in st.session_state[edit_confirm_key]:
+                    st.warning(w)
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("✅ はい、このまま保存", key=f"autoedit_confirm_yes_{entry_id}"):
+                        del st.session_state[edit_confirm_key]
+                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+                        st.cache_data.clear()
+                        _cleanup_edit_state(entry_id, edit_key)
+                        st.rerun()
+                with col_no:
+                    if st.button("↩ いいえ、戻る", key=f"autoedit_confirm_no_{entry_id}"):
+                        del st.session_state[edit_confirm_key]
+                        st.rerun()
         else:
-            st.markdown("**🎯 CP対象品:** （なし）")
+            # --- 閲覧モード ---
+            st.subheader("📋 AI読み取り結果")
+            conf = entry.get("confidence", 0)
+            st.success(f"✅ 信頼度: {conf:.2f} (AI自動確定)")
 
-        kao_items = [
-            item for item in entry.get("items", [])
-            if item.get("is_kao") and not item.get("is_cp_target")
-        ]
-        if kao_items:
-            st.markdown("**🔵 その他花王製品:**")
-            for item in kao_items:
-                price = item.get("price", 0)
-                st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+            if st.button("✏️ 修正する", key=f"auto_edit_btn_{entry_id}"):
+                st.session_state[edit_key] = True
+                st.rerun()
 
-        st.divider()
-        eligibility = get_eligibility_display(entry.get("cp_target_total", 0))
-        st.info(f"→ {eligibility}")
+            st.markdown(f"**店舗**: {entry.get('store_name', '不明')} {entry.get('store_branch', '')}")
+            st.markdown(f"**日時**: {entry.get('purchase_date', '不明')}")
+            st.markdown(f"**税区分**: {entry.get('tax_type', '不明')}")
+            if entry.get("tax_adjusted"):
+                st.caption("※ 税補正済")
+
+            st.divider()
+
+            cp_items = [item for item in entry.get("items", []) if item.get("is_cp_target")]
+            if cp_items:
+                st.markdown("**🎯 CP対象品:**")
+                for item in cp_items:
+                    price = item.get("price", 0)
+                    st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+                cp_total = entry.get("cp_target_total", 0)
+                st.markdown(f"  **CP合計: ¥{cp_total:,}**")
+            else:
+                st.markdown("**🎯 CP対象品:** （なし）")
+
+            kao_items = [
+                item for item in entry.get("items", [])
+                if item.get("is_kao") and not item.get("is_cp_target")
+            ]
+            if kao_items:
+                st.markdown("**🔵 その他花王製品:**")
+                for item in kao_items:
+                    price = item.get("price", 0)
+                    st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+
+            st.divider()
+            eligibility = get_eligibility_display(entry.get("cp_target_total", 0))
+            st.info(f"→ {eligibility}")
 
 
 def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: str = ""):

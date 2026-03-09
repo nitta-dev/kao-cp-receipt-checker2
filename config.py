@@ -126,3 +126,25 @@ def check_eligibility(amount: int, store_name: str, prize_id: str) -> tuple[bool
             expected = "ツルハグループ" if prize["store_group"] == "tsuruha" else "ウエルシアグループ"
             return False, f"店舗条件不一致（{expected}限定）"
     return True, "OK"
+
+
+def check_eligibility_group(
+    cp_total: int,
+    store_groups: list[str | None],
+    prize_id: str,
+) -> tuple[bool, str]:
+    """
+    複数レシート合算版の資格判定。
+    cp_total: 合算後のCP対象品合計
+    store_groups: 各レシートの店舗グループ識別結果のリスト
+    prize_id: 賞ID
+    """
+    prize = get_prize(prize_id)
+    if cp_total < prize["min_amount"]:
+        return False, f"金額不足（{cp_total:,}円 < {prize['min_amount']:,}円）"
+    if prize["store_group"]:
+        # 1枚でも該当店舗グループがあればOK
+        if not any(sg == prize["store_group"] for sg in store_groups):
+            expected = "ツルハグループ" if prize["store_group"] == "tsuruha" else "ウエルシアグループ"
+            return False, f"店舗条件不一致（{expected}限定）"
+    return True, "OK"
