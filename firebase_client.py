@@ -34,6 +34,13 @@ def init_firebase():
     if _app is not None:
         return
 
+    # 既に他で初期化済みの場合
+    try:
+        _app = firebase_admin.get_app()
+        return
+    except ValueError:
+        pass  # まだ初期化されていない
+
     cred = None
     bucket_name = None
 
