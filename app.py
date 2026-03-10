@@ -844,10 +844,11 @@ def _render_needs_input(
     if st.button("🔄 次のレシートへ", type="primary", key="get_next"):
         # 現在のエントリのロックを解放してから次を取得
         current_entry = st.session_state.get("current_entry")
+        skip_id = current_entry["_id"] if current_entry else None
         if current_entry:
             release_entry(campaign, prize_id, current_entry["_id"])
         st.cache_data.clear()
-        entry = get_next_unclaimed_entry(campaign, prize_id, user)
+        entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=skip_id)
         if entry:
             st.session_state["current_entry"] = entry
         else:
@@ -1001,8 +1002,8 @@ def _render_needs_input(
             else:
                 _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                 st.cache_data.clear()
-                # 次のエントリを取得
-                next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
+                # 次のエントリを取得（今保存したエントリは除外）
+                next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
                 st.session_state["current_entry"] = next_entry
                 st.rerun()
 
@@ -1016,7 +1017,7 @@ def _render_needs_input(
                     del st.session_state[confirm_key]
                     _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                     st.cache_data.clear()
-                    next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
+                    next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
                     st.session_state["current_entry"] = next_entry
                     st.rerun()
             with col_no:
@@ -1028,7 +1029,7 @@ def _render_needs_input(
         if st.button("⏭ このレシートは後で入力する", key=f"skip_{entry_id}"):
             release_entry(campaign, prize_id, entry_id)
             st.cache_data.clear()
-            next_entry = get_next_unclaimed_entry(campaign, prize_id, user)
+            next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
             st.session_state["current_entry"] = next_entry
             st.rerun()
 

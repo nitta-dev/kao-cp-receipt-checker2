@@ -273,23 +273,28 @@ def release_entry(campaign: str, prize: str, entry_id: str):
 
 
 def get_next_unclaimed_entry(
-    campaign: str, prize: str, user: str
+    campaign: str, prize: str, user: str, exclude_id: str | None = None
 ) -> dict | None:
     """
     次の未入力・未ロックエントリを取得してロック。
     すでに自分がロック中のエントリがあればそれを返す。
+    exclude_id: このIDのエントリはスキップする（今完了/スキップしたエントリ）
     """
     entries = get_entries(campaign, prize)
     now = _now()
 
-    # まず自分がロック中のエントリを探す
+    # まず自分がロック中のエントリを探す（除外ID以外）
     for entry in entries:
+        if exclude_id and entry["_id"] == exclude_id:
+            continue
         if entry.get("assigned_to") == user and not entry.get("human_input_done"):
             if not entry.get("is_auto"):
                 return entry
 
     # 未入力・未ロックのエントリを探す
     for entry in entries:
+        if exclude_id and entry["_id"] == exclude_id:
+            continue
         if entry.get("is_auto") or entry.get("human_input_done"):
             continue
         assigned_to = entry.get("assigned_to")
