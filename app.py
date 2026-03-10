@@ -43,33 +43,61 @@ st.set_page_config(page_title="花王CP レシートチェックv2", layout="wid
 
 # === 画像表示ヘルパー ===
 
-def render_receipt_image_from_url(storage_path: str, rotation: int = 0):
-    """Storage画像をURL経由で表示（回転対応）"""
+def _image_to_base64(img: Image.Image) -> str:
+    """PIL ImageをBase64文字列に変換"""
+    import base64
+    buf = io.BytesIO()
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _render_zoomable_image(img: Image.Image, zoom: int, container_key: str):
+    """ズーム可能な画像を枠内スクロールで表示"""
+    b64 = _image_to_base64(img)
+    width_pct = zoom
+    container_id = f"img-container-{container_key}"
+    html = f"""
+    <div id="{container_id}" style="
+        width: 100%;
+        height: 600px;
+        overflow: auto;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        cursor: grab;
+    ">
+        <img src="data:image/jpeg;base64,{b64}"
+             style="width: {width_pct}%; max-width: none;"
+             draggable="false" />
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_receipt_image_from_url(storage_path: str, rotation: int = 0, zoom: int = 100):
+    """Storage画像をURL経由で表示（回転・ズーム対応）"""
     if not storage_path:
         st.warning("画像パスが設定されていません")
         return
 
-    if rotation:
-        # 回転が必要な場合はダウンロードしてPILで回転
-        try:
+    try:
+        if rotation or zoom != 100:
             img_bytes = download_image_bytes(storage_path)
             img = Image.open(io.BytesIO(img_bytes))
             img = ImageOps.exif_transpose(img)
-            img = img.rotate(-rotation, expand=True)
-            st.image(img, use_container_width=True)
-        except Exception as e:
-            st.error(f"画像読み込みエラー: {e}")
-    else:
-        try:
-            url = _get_cached_image_url(storage_path)
-            st.image(url, use_container_width=True)
-        except Exception:
-            # 署名URL失敗時はダウンロード表示
+            if rotation:
+                img = img.rotate(-rotation, expand=True)
+            _render_zoomable_image(img, zoom, storage_path)
+        else:
             try:
+                url = _get_cached_image_url(storage_path)
+                st.image(url, use_container_width=True)
+            except Exception:
                 img_bytes = download_image_bytes(storage_path)
                 st.image(img_bytes, use_container_width=True)
-            except Exception as e:
-                st.error(f"画像読み込みエラー: {e}")
+    except Exception as e:
+        st.error(f"画像読み込みエラー: {e}")
 
 
 @st.cache_data(ttl=3000)  # 50分キャッシュ（URLは60分有効）
@@ -90,22 +118,21 @@ def render_receipt_image_local(image_path: str, rotation: int = 0):
     st.image(img, use_container_width=True)
 
 
-def render_receipt_image(entry: dict, rotation: int = 0):
+def render_receipt_image(entry: dict, rotation: int = 0, zoom: int = 100):
     """エントリに応じて適切な画像表示方法を選択（複数画像対応）"""
     images = entry.get("images")
 
     if images and len(images) > 0:
         # 新形式: images配列
         if len(images) == 1:
-            # 1枚だけならタブ不要
-            render_receipt_image_from_url(images[0]["storage_path"], rotation)
+            render_receipt_image_from_url(images[0]["storage_path"], rotation, zoom)
         else:
-            # 複数枚: タブ表示
+            # 複数枚: タブ表示（画像タブは同時実行でも問題ない）
             tab_labels = [f"レシート{img['receipt_number']}枚目" for img in images]
             tabs = st.tabs(tab_labels)
             for tab, img in zip(tabs, images):
                 with tab:
-                    render_receipt_image_from_url(img["storage_path"], rotation)
+                    render_receipt_image_from_url(img["storage_path"], rotation, zoom)
         return
 
     # 旧形式: storage_path / image_path
@@ -113,7 +140,7 @@ def render_receipt_image(entry: dict, rotation: int = 0):
     image_path = entry.get("image_path", "")
 
     if storage_path:
-        render_receipt_image_from_url(storage_path, rotation)
+        render_receipt_image_from_url(storage_path, rotation, zoom)
     elif image_path and Path(image_path).exists():
         render_receipt_image_local(image_path, rotation)
     else:
@@ -810,21 +837,35 @@ def _render_needs_input(
     with col_img:
         st.subheader("📷 レシート画像")
         rotation_key = f"rotation_{entry_id}"
+        zoom_key = f"zoom_{entry_id}"
         if rotation_key not in st.session_state:
             st.session_state[rotation_key] = 0
+        if zoom_key not in st.session_state:
+            st.session_state[zoom_key] = 100
 
-        btn_cols = st.columns(3)
+        btn_cols = st.columns(5)
         with btn_cols[0]:
             if st.button("⬅ 左回転", key=f"rot_l_{entry_id}"):
                 st.session_state[rotation_key] = (st.session_state[rotation_key] - 90) % 360
         with btn_cols[1]:
             if st.button("🔄 リセット", key=f"rot_r_{entry_id}"):
                 st.session_state[rotation_key] = 0
+                st.session_state[zoom_key] = 100
         with btn_cols[2]:
             if st.button("➡ 右回転", key=f"rot_rr_{entry_id}"):
                 st.session_state[rotation_key] = (st.session_state[rotation_key] + 90) % 360
+        with btn_cols[3]:
+            if st.button("🔍-", key=f"zoom_out_{entry_id}"):
+                st.session_state[zoom_key] = max(50, st.session_state[zoom_key] - 50)
+        with btn_cols[4]:
+            if st.button("🔍+", key=f"zoom_in_{entry_id}"):
+                st.session_state[zoom_key] = min(400, st.session_state[zoom_key] + 50)
 
-        render_receipt_image(current, st.session_state[rotation_key])
+        zoom = st.session_state[zoom_key]
+        if zoom != 100:
+            st.caption(f"ズーム: {zoom}%")
+
+        render_receipt_image(current, st.session_state[rotation_key], zoom)
 
     with col_form:
         st.subheader("📝 データ入力")
@@ -979,21 +1020,35 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
     with col_img:
         st.subheader("📷 レシート画像")
         rotation_key = f"auto_rotation_{entry_id}"
+        zoom_key = f"auto_zoom_{entry_id}"
         if rotation_key not in st.session_state:
             st.session_state[rotation_key] = 0
+        if zoom_key not in st.session_state:
+            st.session_state[zoom_key] = 100
 
-        btn_cols = st.columns(3)
+        btn_cols = st.columns(5)
         with btn_cols[0]:
             if st.button("⬅ 左回転", key=f"auto_rot_l_{entry_id}"):
                 st.session_state[rotation_key] = (st.session_state[rotation_key] - 90) % 360
         with btn_cols[1]:
             if st.button("🔄 リセット", key=f"auto_rot_r_{entry_id}"):
                 st.session_state[rotation_key] = 0
+                st.session_state[zoom_key] = 100
         with btn_cols[2]:
             if st.button("➡ 右回転", key=f"auto_rot_rr_{entry_id}"):
                 st.session_state[rotation_key] = (st.session_state[rotation_key] + 90) % 360
+        with btn_cols[3]:
+            if st.button("🔍-", key=f"auto_zoom_out_{entry_id}"):
+                st.session_state[zoom_key] = max(50, st.session_state[zoom_key] - 50)
+        with btn_cols[4]:
+            if st.button("🔍+", key=f"auto_zoom_in_{entry_id}"):
+                st.session_state[zoom_key] = min(400, st.session_state[zoom_key] + 50)
 
-        render_receipt_image(entry, st.session_state[rotation_key])
+        zoom = st.session_state[zoom_key]
+        if zoom != 100:
+            st.caption(f"ズーム: {zoom}%")
+
+        render_receipt_image(entry, st.session_state[rotation_key], zoom)
 
     with col_data:
         if is_editing:
@@ -1189,21 +1244,35 @@ def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: 
     with col_img:
         st.subheader("📷 レシート画像")
         rotation_key = f"done_rotation_{entry_id}"
+        zoom_key = f"done_zoom_{entry_id}"
         if rotation_key not in st.session_state:
             st.session_state[rotation_key] = 0
+        if zoom_key not in st.session_state:
+            st.session_state[zoom_key] = 100
 
-        btn_cols = st.columns(3)
+        btn_cols = st.columns(5)
         with btn_cols[0]:
             if st.button("⬅ 左回転", key=f"done_rot_l_{entry_id}"):
                 st.session_state[rotation_key] = (st.session_state[rotation_key] - 90) % 360
         with btn_cols[1]:
             if st.button("🔄 リセット", key=f"done_rot_r_{entry_id}"):
                 st.session_state[rotation_key] = 0
+                st.session_state[zoom_key] = 100
         with btn_cols[2]:
             if st.button("➡ 右回転", key=f"done_rot_rr_{entry_id}"):
                 st.session_state[rotation_key] = (st.session_state[rotation_key] + 90) % 360
+        with btn_cols[3]:
+            if st.button("🔍-", key=f"done_zoom_out_{entry_id}"):
+                st.session_state[zoom_key] = max(50, st.session_state[zoom_key] - 50)
+        with btn_cols[4]:
+            if st.button("🔍+", key=f"done_zoom_in_{entry_id}"):
+                st.session_state[zoom_key] = min(400, st.session_state[zoom_key] + 50)
 
-        render_receipt_image(entry, st.session_state[rotation_key])
+        zoom = st.session_state[zoom_key]
+        if zoom != 100:
+            st.caption(f"ズーム: {zoom}%")
+
+        render_receipt_image(entry, st.session_state[rotation_key], zoom)
 
     with col_data:
         if is_editing:
