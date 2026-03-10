@@ -221,23 +221,30 @@ def _render_entry_form(entry: dict, entry_id: str, key_prefix: str = "") -> dict
         except ValueError:
             pass
 
-    col_date, col_time = st.columns([2, 1])
+    col_date, col_hour, col_min = st.columns([3, 1, 1])
     with col_date:
         purchase_date_val = st.date_input(
             "📅 購入日",
             value=existing_date_val,
             key=f"{p}purchase_date_{entry_id}",
         )
-    with col_time:
-        purchase_time_val = st.time_input(
-            "🕐 時刻",
-            value=existing_time_val,
-            step=60,
-            key=f"{p}purchase_time_{entry_id}",
+    with col_hour:
+        purchase_hour = st.selectbox(
+            "🕐 時",
+            options=list(range(24)),
+            index=existing_time_val.hour,
+            key=f"{p}purchase_hour_{entry_id}",
+        )
+    with col_min:
+        purchase_min = st.selectbox(
+            "分",
+            options=list(range(60)),
+            index=existing_time_val.minute,
+            key=f"{p}purchase_min_{entry_id}",
         )
 
     if purchase_date_val:
-        purchase_date = f"{purchase_date_val.strftime('%Y-%m-%d')} {purchase_time_val.strftime('%H:%M')}"
+        purchase_date = f"{purchase_date_val.strftime('%Y-%m-%d')} {purchase_hour:02d}:{purchase_min:02d}"
     else:
         purchase_date = ""
 
@@ -462,11 +469,17 @@ def main():
     # チームメンバーをFirestoreから取得（初回は config.py のデフォルトで初期化）
     members = init_team_members(campaign, TEAM_MEMBERS)
 
-    # 担当者選択
+    # 担当者選択（変更時にエントリを切り替え）
+    def _on_user_change():
+        """担当者変更時に現在のエントリをクリアして再取得させる"""
+        st.session_state.pop("current_entry", None)
+        st.cache_data.clear()
+
     user = st.sidebar.selectbox(
         "👤 担当者",
         members,
         key="current_user",
+        on_change=_on_user_change,
     )
 
     # メンバー管理
