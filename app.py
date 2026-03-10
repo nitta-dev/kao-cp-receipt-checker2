@@ -469,29 +469,27 @@ def main():
     # チームメンバーをFirestoreから取得（初回は config.py のデフォルトで初期化）
     members = init_team_members(campaign, TEAM_MEMBERS)
 
-    # 担当者選択（変更時にエントリを切り替え）
-    def _on_user_change():
-        """担当者変更時に現在のエントリをクリアして再取得させる"""
-        st.session_state["selected_user"] = st.session_state["current_user"]
-        st.session_state.pop("current_entry", None)
-        st.cache_data.clear()
+    # 担当者選択（session_stateで確実に保持）
+    if "selected_user" not in st.session_state:
+        st.session_state["selected_user"] = members[0] if members else ""
 
-    # 前回選択した担当者を復元
-    saved_user = st.session_state.get("selected_user", None)
-    default_idx = 0
-    if saved_user and saved_user in members:
-        default_idx = members.index(saved_user)
+    # selectboxでkeyを使わず、戻り値で制御（keyだとrerun時にリセットされる問題の回避）
+    saved_user = st.session_state["selected_user"]
+    default_idx = members.index(saved_user) if saved_user in members else 0
 
     user = st.sidebar.selectbox(
         "👤 担当者",
         members,
         index=default_idx,
-        key="current_user",
-        on_change=_on_user_change,
+        key="current_user_select",
     )
-    # 初回選択時も保存
-    if "selected_user" not in st.session_state:
+
+    # 担当者が変わったらエントリを切り替え
+    if user != st.session_state["selected_user"]:
         st.session_state["selected_user"] = user
+        st.session_state.pop("current_entry", None)
+        st.cache_data.clear()
+        st.rerun()
 
     # メンバー管理
     with st.sidebar.expander("👥 メンバー管理"):
