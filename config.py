@@ -128,6 +128,38 @@ def check_eligibility(amount: int, store_name: str, prize_id: str) -> tuple[bool
     return True, "OK"
 
 
+# ==== CSV列マッピング（import_csv.py用） ====
+CSV_COLUMNS_MAP = {
+    "form_id": "フォームID",
+    "answer_id": "回答ID",
+    "answered_at": "回答日時",
+    "updated_at_csv": "更新日時",
+    "q1_confirm": "Q1.応募規約に記載の【ビオレ ザ ボディ】【ビオレ ザ ハンド】シリーズ 関連商品を対象金額以上ご購入いただいた方が対象です。 条件を満たしているか、再度ご確認いただけますでしょうか。",
+    "q2_course": "Q2.ご希望の応募コースを選択してください。",
+    "receipt_1": "Q3.レシートの写真をアップロードしてください。（１枚目）",
+    "receipt_2": "Q3 レシートの写真をアップロードしてください。（２枚目）",
+    "receipt_3": "Q3 レシートの写真をアップロードしてください。（３枚目）",
+    "receipt_4": "Q3 レシートの写真をアップロードしてください。（４枚目）",
+    "receipt_5": "Q3 レシートの写真をアップロードしてください。（５枚目）",
+    "receipt_6": "Q3 レシートの写真をアップロードしてください。（６枚目）",
+    "receipt_7": "Q3 レシートの写真をアップロードしてください。（７枚目）",
+    "q4_source": "Q4.どこでこのキャンペーンを知りましたか？",
+    "q4_source_other": "Q4.どこでこのキャンペーンを知りましたか？(その他テキスト)",
+    "last_name": "お名前(姓)",
+    "first_name": "お名前(名)",
+    "postal_code": "郵便番号",
+    "prefecture": "都道府県",
+    "city": "市区町村",
+    "address1": "市区町村以下",
+    "address2": "番地",
+    "building": "ビル建物名",
+    "phone": "電話番号",
+    "email": "メールアドレス",
+    "age": "年齢",
+    "gender": "性別",
+}
+
+
 def check_eligibility_group(
     cp_total: int,
     store_groups: list[str | None],

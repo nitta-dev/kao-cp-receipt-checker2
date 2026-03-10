@@ -13,6 +13,11 @@ import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from google.cloud.firestore_v1 import FieldFilter
 from PIL import Image
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
 from config import LOCK_TIMEOUT_MINUTES
 
@@ -103,15 +108,21 @@ def _entries_ref(campaign: str, prize: str):
 
 # === エントリ CRUD ===
 
-def get_entries(campaign: str, prize: str, order_by: str = "file_number") -> list[dict]:
-    """エントリ一覧を取得（file_number昇順）"""
+def get_entries(campaign: str, prize: str, order_by: str | None = None) -> list[dict]:
+    """エントリ一覧を取得（ソートキー自動判定）"""
     ref = _entries_ref(campaign, prize)
-    docs = ref.order_by(order_by).stream()
+    docs = list(ref.stream())
     entries = []
     for doc in docs:
         entry = doc.to_dict()
         entry["_id"] = doc.id
         entries.append(entry)
+
+    # ソート: form_idがあればform_id→answer_id順、なければfile_number順
+    if entries and "form_id" in entries[0]:
+        entries.sort(key=lambda e: (e.get("form_id", 0), e.get("answer_id", 0)))
+    elif entries and "file_number" in entries[0]:
+        entries.sort(key=lambda e: e.get("file_number", 0))
     return entries
 
 
@@ -148,6 +159,32 @@ def create_entries_batch(campaign: str, prize: str, entries: list[dict]):
             batch.set(doc_ref, entry)
         batch.commit()
         print(f"  バッチ書き込み: {i + 1}〜{min(i + len(chunk), len(entries))} / {len(entries)}")
+
+
+def delete_all_entries(campaign: str, prize: str) -> int:
+    """指定賞のエントリを全削除（バッチ）"""
+    db = _db()
+    ref = _entries_ref(campaign, prize)
+    docs = list(ref.stream())
+    count = len(docs)
+    batch_size = 500
+    for i in range(0, count, batch_size):
+        chunk = docs[i:i + batch_size]
+        batch = db.batch()
+        for doc in chunk:
+            batch.delete(doc.reference)
+        batch.commit()
+    return count
+
+
+def delete_storage_folder(prefix: str) -> int:
+    """Storageの指定プレフィックス配下を全削除"""
+    bucket = _bucket()
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    count = len(blobs)
+    for blob in blobs:
+        blob.delete()
+    return count
 
 
 # === 進捗統計 ===
@@ -264,6 +301,13 @@ def get_next_unclaimed_entry(
     return None  # 全エントリ処理済み
 
 
+def get_entry_display_key(entry: dict) -> str:
+    """エントリの表示用キーを取得（form_id_answer_id or file_number）"""
+    if "form_id" in entry and "answer_id" in entry:
+        return f"{entry['form_id']}_{entry['answer_id']}"
+    return str(entry.get("file_number", "?"))
+
+
 def get_active_workers(campaign: str, prize: str) -> list[dict]:
     """現在作業中のユーザー一覧"""
     entries = get_entries(campaign, prize)
@@ -277,7 +321,7 @@ def get_active_workers(campaign: str, prize: str) -> list[dict]:
             workers.append({
                 "user": assigned_to,
                 "entry_id": entry["_id"],
-                "file_number": entry.get("file_number", "?"),
+                "display_key": get_entry_display_key(entry),
                 "minutes_ago": int(elapsed.total_seconds() / 60),
             })
     return workers

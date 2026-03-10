@@ -27,6 +27,7 @@ from firebase_client import (
     release_entry,
     get_next_unclaimed_entry,
     get_active_workers,
+    get_entry_display_key,
     get_image_url,
     download_image_bytes,
     get_team_members,
@@ -90,7 +91,24 @@ def render_receipt_image_local(image_path: str, rotation: int = 0):
 
 
 def render_receipt_image(entry: dict, rotation: int = 0):
-    """エントリに応じて適切な画像表示方法を選択"""
+    """エントリに応じて適切な画像表示方法を選択（複数画像対応）"""
+    images = entry.get("images")
+
+    if images and len(images) > 0:
+        # 新形式: images配列
+        if len(images) == 1:
+            # 1枚だけならタブ不要
+            render_receipt_image_from_url(images[0]["storage_path"], rotation)
+        else:
+            # 複数枚: タブ表示
+            tab_labels = [f"レシート{img['receipt_number']}枚目" for img in images]
+            tabs = st.tabs(tab_labels)
+            for tab, img in zip(tabs, images):
+                with tab:
+                    render_receipt_image_from_url(img["storage_path"], rotation)
+        return
+
+    # 旧形式: storage_path / image_path
     storage_path = entry.get("storage_path")
     image_path = entry.get("image_path", "")
 
@@ -114,8 +132,10 @@ def get_eligibility_display(cp_total: int) -> str:
     return "資格なし"
 
 
-def extract_filename_number(entry: dict) -> int:
-    """エントリからファイル番号を取得"""
+def extract_filename_number(entry: dict) -> int | str:
+    """エントリからファイル番号または表示キーを取得"""
+    if "form_id" in entry and "answer_id" in entry:
+        return entry["answer_id"]
     if "file_number" in entry:
         return entry["file_number"]
     name = Path(entry.get("image_path", "")).name
@@ -125,6 +145,11 @@ def extract_filename_number(entry: dict) -> int:
         except (ValueError, IndexError):
             pass
     return 9999
+
+
+def get_entry_label(entry: dict) -> str:
+    """エントリの表示ラベルを取得"""
+    return get_entry_display_key(entry)
 
 
 # ============================================================
@@ -425,7 +450,7 @@ def main():
     prize_id = st.sidebar.selectbox(
         "🏆 対象賞",
         list(PRIZES.keys()),
-        index=list(PRIZES.keys()).index("B"),
+        index=list(PRIZES.keys()).index("A"),
         format_func=lambda pid: f"{pid}: {PRIZES[pid]['name']}",
         key="prize_select",
     )
@@ -517,7 +542,7 @@ def page_dashboard(campaign: str):
     if all_workers:
         for w in all_workers:
             st.markdown(
-                f"- **{w['user']}** → {w['prize']}賞 #{w['file_number']} "
+                f"- **{w['user']}** → {w['prize']}賞 #{w['display_key']} "
                 f"（{w['minutes_ago']}分前）"
             )
     else:
@@ -583,18 +608,12 @@ def _render_prize_detail(campaign: str, prize_id: str, stats: dict):
 
     # 複数レシート応募者の情報
     entries = get_entries(campaign, prize_id)
-    fn_groups: dict[int, list] = {}
-    for e in entries:
-        fn = extract_filename_number(e)
-        fn_groups.setdefault(fn, []).append(e)
-    multi_receipt = {fn: g for fn, g in fn_groups.items() if len(g) > 1}
+    multi_receipt = [e for e in entries if e.get("receipt_count", 1) > 1]
     if multi_receipt:
-        st.info(f"📎 複数レシート応募者: {len(multi_receipt)}組（最大{max(len(g) for g in multi_receipt.values())}枚）")
-        with st.expander("複数レシートの詳細"):
-            for fn, group in sorted(multi_receipt.items()):
-                st.markdown(f"**#{fn}** — {len(group)}枚")
+        max_receipts = max(e.get("receipt_count", 1) for e in multi_receipt)
+        st.info(f"📎 複数レシート応募者: {len(multi_receipt)}件（最大{max_receipts}枚）")
     else:
-        st.caption(f"全{len(fn_groups)}人（複数レシート応募なし）")
+        st.caption(f"全{len(entries)}件（複数レシート応募なし）")
 
     ready = stats["needs_input"] == 0
     if ready:
@@ -750,11 +769,23 @@ def _render_needs_input(
 
     entry_id = current["_id"]
     filename = current.get("original_filename", Path(current.get("image_path", "")).name)
-    file_num = extract_filename_number(current)
+    display_key = get_entry_label(current)
     conf = current.get("confidence", 0)
     error = current.get("error")
 
-    st.markdown(f"### 📝 #{file_num} {filename}")
+    st.markdown(f"### 📝 #{display_key}")
+
+    # 応募者情報（CSVインポート時）
+    if current.get("last_name"):
+        with st.expander("👤 応募者情報"):
+            st.markdown(
+                f"**氏名**: {current.get('last_name', '')} {current.get('first_name', '')}  \n"
+                f"**〒**: {current.get('postal_code', '')} {current.get('prefecture', '')} "
+                f"{current.get('city', '')} {current.get('address1', '')} "
+                f"{current.get('address2', '')} {current.get('building', '')}  \n"
+                f"**TEL**: {current.get('phone', '')}  \n"
+                f"**コース**: {current.get('q2_course', '')}"
+            )
     if error:
         st.warning("📛 AIがこのレシートを読み取れませんでした。レシート画像を見て入力してください。")
         with st.expander("エラー詳細（管理者向け）"):
@@ -762,26 +793,10 @@ def _render_needs_input(
     elif conf is not None:
         st.warning("⚠️ AIの読み取り精度が低いため、手入力をお願いします")
 
-    # 同一file_numberの関連レシートを表示
-    related = [e for e in needs_input if extract_filename_number(e) == file_num and e.get("_id") != entry_id]
-    # 他タブの同一file_numberも検索
-    all_entries = _get_cached_entries(campaign, prize_id)
-    related_other = [
-        e for e in all_entries
-        if extract_filename_number(e) == file_num and e.get("_id") != entry_id
-    ]
-    if related_other:
-        st.info(f"📎 この応募者は{len(related_other) + 1}枚のレシートを提出しています")
-        with st.expander(f"関連レシート（{len(related_other)}枚）"):
-            for re_entry in related_other:
-                re_fname = re_entry.get("original_filename", "")
-                re_status = "✅自動確定" if re_entry.get("is_auto") and not re_entry.get("human_input_done") else (
-                    "📝入力済" if re_entry.get("human_input_done") else "⏳未入力"
-                )
-                re_cp = re_entry.get("cp_target_total", re_entry.get("human_cp_total", 0))
-                st.markdown(f"- {re_fname} [{re_status}] CP: ¥{re_cp:,}")
-                if re_entry.get("storage_path") or re_entry.get("image_path"):
-                    render_receipt_image(re_entry)
+    # 複数レシート表示（images配列に含まれる）
+    receipt_count = current.get("receipt_count", len(current.get("images", [])))
+    if receipt_count > 1:
+        st.info(f"📎 この応募者は{receipt_count}枚のレシートを提出しています")
 
     st.caption(f"担当: {user} | エントリID: {entry_id}")
 
@@ -902,10 +917,10 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
 
     st.caption(f"信頼度 {CONFIDENCE_THRESHOLD} 以上のエントリ（修正可能）")
 
-    entries_sorted = sorted(entries, key=extract_filename_number)
+    entries_sorted = sorted(entries, key=lambda e: (e.get("form_id", 0), e.get("answer_id", extract_filename_number(e))))
 
     options = [
-        f"#{extract_filename_number(e)} {e.get('original_filename', Path(e.get('image_path', '')).name)} "
+        f"#{get_entry_label(e)} "
         f"(conf: {e.get('confidence', 0):.2f})"
         for e in entries_sorted
     ]
@@ -1081,8 +1096,7 @@ def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: 
         return
 
     options = [
-        f"#{extract_filename_number(e)} "
-        f"{e.get('original_filename', Path(e.get('image_path', '')).name)} "
+        f"#{get_entry_label(e)} "
         f"— CP: ¥{e.get('human_cp_total', 0):,}"
         for e in filtered
     ]
@@ -1215,7 +1229,6 @@ def _render_all_entries(entries: list[dict]):
 
     rows = []
     for e in entries:
-        filename = e.get("original_filename", Path(e.get("image_path", "")).name)
         conf = e.get("confidence", 0)
         error = e.get("error")
 
@@ -1237,17 +1250,21 @@ def _render_all_entries(entries: list[dict]):
             store = ""
 
         assigned = e.get("assigned_to", "")
-        rows.append({
-            "#": extract_filename_number(e),
-            "ファイル名": filename,
+        row = {
+            "ID": get_entry_label(e),
             "信頼度": f"{conf:.2f}" if conf and not error else ("ERR" if error else "-"),
             "状態": status,
+            "レシート数": e.get("receipt_count", 1),
             "店舗": store,
             "CP合計": f"¥{cp_total:,}" if cp_total else "",
             "担当": assigned or "",
-        })
+        }
+        # 応募者情報があれば表示
+        if e.get("last_name"):
+            row["応募者"] = f"{e.get('last_name', '')} {e.get('first_name', '')}"
+        rows.append(row)
 
-    df = pd.DataFrame(rows).sort_values("#")
+    df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 

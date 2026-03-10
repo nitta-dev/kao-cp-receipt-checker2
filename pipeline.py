@@ -156,11 +156,34 @@ def cmd_ocr(args):
         init_firebase()
         entries = get_entries(args.campaign, args.prize)
 
-        # confidence未設定のエントリのみOCR
-        targets = [e for e in entries if e.get("confidence") is None and not e.get("error")]
-        print(f"OCR対象: {len(targets)}件 / 全{len(entries)}件")
+        # OCR対象の判定: images配列がある場合は各画像単位、旧形式はエントリ単位
+        targets = []
+        for e in entries:
+            if e.get("images"):
+                # 新形式: images配列内でOCR未実行の画像があるエントリ
+                has_unprocessed = any(
+                    not img.get("ocr_done") for img in e["images"]
+                )
+                if has_unprocessed:
+                    targets.append(e)
+            else:
+                # 旧形式: confidence未設定
+                if e.get("confidence") is None and not e.get("error"):
+                    targets.append(e)
 
-        if not targets:
+        # OCRタスクをフラット化（1画像=1タスク）
+        ocr_tasks = []
+        for e in targets:
+            if e.get("images"):
+                for img in e["images"]:
+                    if not img.get("ocr_done"):
+                        ocr_tasks.append((e, img))
+            else:
+                ocr_tasks.append((e, None))
+
+        print(f"OCR対象: {len(ocr_tasks)}画像 ({len(targets)}エントリ) / 全{len(entries)}件")
+
+        if not ocr_tasks:
             print("全てOCR処理済みです。")
             return
 
@@ -172,34 +195,77 @@ def cmd_ocr(args):
         lock = threading.Lock()
         completed = 0
 
-        def _ocr_one(entry, max_retries=3):
+        def _ocr_one(entry, img_info=None, max_retries=3):
             """1件のOCR処理（スレッドセーフ・リトライ付き）"""
             import time as _time
             entry_id = entry["_id"]
-            storage_path = entry.get("storage_path", "")
-            filename = entry.get("original_filename", "?")
+
+            if img_info:
+                # 新形式: images配列内の1画像
+                storage_path = img_info["storage_path"]
+                filename = img_info.get("original_filename", "?")
+            else:
+                # 旧形式
+                storage_path = entry.get("storage_path", "")
+                filename = entry.get("original_filename", "?")
 
             for attempt in range(max_retries):
                 try:
                     img_bytes = download_image_bytes(storage_path)
                     result = ocr_single_from_bytes(img_bytes, filename)
 
-                    update_data = {
-                        "confidence": result.get("confidence"),
-                        "is_auto": result.get("is_auto", False),
-                        "error": result.get("error"),
-                        "store_name": result.get("store_name"),
-                        "store_branch": result.get("store_branch"),
-                        "purchase_date": result.get("purchase_date"),
-                        "items": result.get("items", []),
-                        "tax_type": result.get("tax_type"),
-                        "tax_adjusted": result.get("tax_adjusted", False),
-                        "subtotal": result.get("subtotal"),
-                        "total": result.get("total"),
-                        "cp_target_total": result.get("cp_target_total", 0),
-                        "kao_other_total": result.get("kao_other_total", 0),
-                    }
-                    update_entry(args.campaign, args.prize, entry_id, update_data)
+                    if img_info:
+                        # 新形式: images配列内の該当画像にOCR結果を格納
+                        img_info["ocr_done"] = True
+                        img_info["confidence"] = result.get("confidence")
+                        img_info["is_auto"] = result.get("is_auto", False)
+                        img_info["error"] = result.get("error")
+                        img_info["store_name"] = result.get("store_name")
+                        img_info["store_branch"] = result.get("store_branch")
+                        img_info["purchase_date"] = result.get("purchase_date")
+                        img_info["items"] = result.get("items", [])
+                        img_info["tax_type"] = result.get("tax_type")
+                        img_info["tax_adjusted"] = result.get("tax_adjusted", False)
+                        img_info["subtotal"] = result.get("subtotal")
+                        img_info["total"] = result.get("total")
+                        img_info["cp_target_total"] = result.get("cp_target_total", 0)
+                        img_info["kao_other_total"] = result.get("kao_other_total", 0)
+
+                        # エントリ全体の集計を更新
+                        images = entry["images"]
+                        all_done = all(i.get("ocr_done") for i in images)
+                        min_conf = min(
+                            (i.get("confidence", 0) for i in images if i.get("ocr_done")),
+                            default=0,
+                        )
+                        total_cp = sum(
+                            i.get("cp_target_total", 0) for i in images if i.get("ocr_done")
+                        )
+                        update_data = {
+                            "images": images,
+                            "confidence": min_conf if all_done else None,
+                            "is_auto": min_conf >= CONFIDENCE_THRESHOLD if all_done else False,
+                            "cp_target_total": total_cp,
+                        }
+                        update_entry(args.campaign, args.prize, entry_id, update_data)
+                    else:
+                        # 旧形式
+                        update_data = {
+                            "confidence": result.get("confidence"),
+                            "is_auto": result.get("is_auto", False),
+                            "error": result.get("error"),
+                            "store_name": result.get("store_name"),
+                            "store_branch": result.get("store_branch"),
+                            "purchase_date": result.get("purchase_date"),
+                            "items": result.get("items", []),
+                            "tax_type": result.get("tax_type"),
+                            "tax_adjusted": result.get("tax_adjusted", False),
+                            "subtotal": result.get("subtotal"),
+                            "total": result.get("total"),
+                            "cp_target_total": result.get("cp_target_total", 0),
+                            "kao_other_total": result.get("kao_other_total", 0),
+                        }
+                        update_entry(args.campaign, args.prize, entry_id, update_data)
                     return ("ok", filename, result)
                 except Exception as e:
                     if attempt < max_retries - 1:
@@ -207,15 +273,20 @@ def cmd_ocr(args):
                         _time.sleep(wait)
                         continue
                     try:
-                        update_entry(args.campaign, args.prize, entry_id, {"error": str(e)})
+                        if img_info:
+                            img_info["ocr_done"] = True
+                            img_info["error"] = str(e)
+                            update_entry(args.campaign, args.prize, entry_id, {"images": entry["images"]})
+                        else:
+                            update_entry(args.campaign, args.prize, entry_id, {"error": str(e)})
                     except Exception:
                         pass
                     return ("error", filename, str(e))
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_ocr_one, entry): entry
-                for entry in targets
+                executor.submit(_ocr_one, entry, img_info): (entry, img_info)
+                for entry, img_info in ocr_tasks
             }
             for future in as_completed(futures):
                 completed += 1
@@ -223,10 +294,10 @@ def cmd_ocr(args):
                 if status_type == "ok":
                     conf = data.get("confidence", 0)
                     label = "AUTO" if data.get("is_auto") else "MANUAL"
-                    print(f"  [{completed}/{len(targets)}] {filename}: conf={conf:.2f} -> {label}")
+                    print(f"  [{completed}/{len(ocr_tasks)}] {filename}: conf={conf:.2f} -> {label}")
                     success += 1
                 else:
-                    print(f"  [{completed}/{len(targets)}] {filename}: ERROR - {data}")
+                    print(f"  [{completed}/{len(ocr_tasks)}] {filename}: ERROR - {data}")
                     errors += 1
 
         auto_count = sum(
@@ -234,7 +305,7 @@ def cmd_ocr(args):
             if e.get("is_auto")
         )
         print(f"\n=== OCR完了 ===")
-        print(f"処理: {success}件, エラー: {errors}件")
+        print(f"処理: {success}画像, エラー: {errors}画像")
         print(f"AI自動確定: {auto_count}件")
 
 
@@ -278,7 +349,7 @@ def cmd_split(args):
 
 
 def _get_file_number(entry: dict) -> int:
-    """エントリからfile_numberを取得"""
+    """エントリからfile_numberを取得（後方互換）"""
     if "file_number" in entry:
         return entry["file_number"]
     return _extract_filename_number(
@@ -286,8 +357,60 @@ def _get_file_number(entry: dict) -> int:
     )
 
 
+def _get_entry_key(entry: dict) -> str:
+    """エントリの一意キーを取得（form_id_answer_id or file_number）"""
+    if "form_id" in entry and "answer_id" in entry:
+        return f"{entry['form_id']}_{entry['answer_id']}"
+    return str(_get_file_number(entry))
+
+
+def _get_entry_data_multi(entry: dict) -> dict:
+    """
+    新形式エントリ（images配列）からデータを統一的に取得。
+    各画像のOCR結果を合算する。
+    人間入力済みの場合はhuman_*フィールドを優先。
+    """
+    if entry.get("human_input_done"):
+        return _get_entry_data(entry)
+
+    images = entry.get("images", [])
+    if not images:
+        return _get_entry_data(entry)
+
+    # images配列内の各画像のOCR結果を合算
+    cp_total = 0
+    store_names = []
+    store_branches = []
+    all_cp_items = []
+    all_kao_items = []
+
+    for img in images:
+        if img.get("is_auto") or img.get("ocr_done"):
+            cp_items = [i for i in img.get("items", []) if i.get("is_cp_target")]
+            kao_items = [i for i in img.get("items", []) if i.get("is_kao") and not i.get("is_cp_target")]
+            all_cp_items.extend(cp_items)
+            all_kao_items.extend(kao_items)
+            cp_total += img.get("cp_target_total", 0)
+            if img.get("store_name"):
+                store_names.append(img["store_name"])
+            if img.get("store_branch"):
+                store_branches.append(img["store_branch"])
+
+    return {
+        "store_name": store_names[0] if store_names else "",
+        "store_branch": store_branches[0] if store_branches else "",
+        "purchase_date": "",
+        "cp_items": all_cp_items,
+        "kao_items": all_kao_items,
+        "unknown_items": [],
+        "cp_total": cp_total,
+        "tax_type": "",
+        "tax_adjusted": False,
+    }
+
+
 def cmd_lottery(args):
-    """抽選: エントリから賞ごとに当選者を抽出（同一file_number合算対応）"""
+    """抽選: エントリから賞ごとに当選者を抽出（新形式: 1エントリ=1応募者）"""
     entries = _load_entries(args)
     prize_id = args.prize
     seed = args.seed
@@ -298,13 +421,13 @@ def cmd_lottery(args):
         if entry.get("is_auto"):
             continue
         if not entry.get("human_input_done"):
-            fname = entry.get("original_filename", entry.get("image_path", "?"))
-            not_done.append(fname)
+            key = _get_entry_key(entry)
+            not_done.append(key)
 
     if not_done:
         print(f"⚠️ 警告: {len(not_done)}件の未入力エントリがあります。抽選を中断します。")
-        for path in not_done[:10]:
-            print(f"  - {Path(path).name}")
+        for key in not_done[:10]:
+            print(f"  - {key}")
         if len(not_done) > 10:
             print(f"  ... 他{len(not_done) - 10}件")
         print("\n全エントリの確認・入力を完了してから再実行してください。")
@@ -314,83 +437,60 @@ def cmd_lottery(args):
 
     prize = PRIZES[prize_id]
 
-    # --- file_number単位でグループ化 ---
-    groups: dict[int, list[dict]] = {}
+    eligible_entries = []
+    ineligible_entries = []
+
     for entry in entries:
-        fn = _get_file_number(entry)
-        groups.setdefault(fn, []).append(entry)
-
-    multi_receipt_count = sum(1 for g in groups.values() if len(g) > 1)
-    if multi_receipt_count > 0:
-        print(f"📎 複数レシート応募者: {multi_receipt_count}組")
-
-    eligible_groups = []   # (file_number, group_entries)
-    ineligible_entries = []  # flat list of individual entries with reason
-
-    for fn, group_entries in groups.items():
-        # 読み取り不可チェック: 全レシートが読み取り不可なら対象外
-        all_unreadable = all(e.get("unreadable") for e in group_entries)
-        if all_unreadable:
-            for e in group_entries:
-                e["lottery_result"] = "対象外"
-                ineligible_entries.append({**e, "reason": "レシート読み取り不可"})
+        # 読み取り不可チェック
+        if entry.get("unreadable"):
+            entry["lottery_result"] = "対象外"
+            ineligible_entries.append({**entry, "reason": "レシート読み取り不可"})
             continue
 
-        # 合算: 読み取り可能なエントリのCP合計を合算
-        cp_total = 0
-        store_groups_list = []
-        for e in group_entries:
-            if e.get("unreadable"):
-                continue
-            data = _get_entry_data(e)
-            cp_total += data["cp_total"]
-            store = data["store_name"]
-            store_groups_list.append(identify_store_group(store))
+        # 新形式（images配列）の場合は合算データを使用
+        if entry.get("images"):
+            data = _get_entry_data_multi(entry)
+        else:
+            data = _get_entry_data(entry)
 
-        # 合算値を各エントリに記録（参照用）
-        for e in group_entries:
-            e["aggregated_cp_total"] = cp_total
-            e["receipt_count"] = len(group_entries)
+        cp_total = data["cp_total"]
+        store = data["store_name"]
+        store_groups_list = [identify_store_group(store)]
 
-        # 資格判定（合算後の金額で判定）
+        # 複数レシートの場合、各レシートの店舗も考慮
+        if entry.get("images"):
+            store_groups_list = []
+            for img in entry["images"]:
+                s = img.get("store_name", "")
+                store_groups_list.append(identify_store_group(s))
+
+        entry["aggregated_cp_total"] = cp_total
+
         ok, reason = check_eligibility_group(cp_total, store_groups_list, prize_id)
 
         if ok:
-            eligible_groups.append((fn, group_entries))
+            eligible_entries.append(entry)
         else:
-            for e in group_entries:
-                ineligible_entries.append({**e, "reason": reason})
+            ineligible_entries.append({**entry, "reason": reason})
 
-    # --- file_number単位で抽選（1人1エントリ） ---
-    random.shuffle(eligible_groups)
+    # --- 抽選 ---
+    random.shuffle(eligible_entries)
 
-    winner_groups = eligible_groups[:prize["winners"]]
-    reserve_groups = eligible_groups[prize["winners"]:prize["winners"] + prize["reserve"]]
-    loser_groups = eligible_groups[prize["winners"] + prize["reserve"]:]
+    winners = eligible_entries[:prize["winners"]]
+    reserves = eligible_entries[prize["winners"]:prize["winners"] + prize["reserve"]]
+    losers = eligible_entries[prize["winners"] + prize["reserve"]:]
 
-    # 結果を各エントリに書き込む
-    for _, group_entries in winner_groups:
-        for e in group_entries:
-            e["lottery_result"] = "当選"
-    for _, group_entries in reserve_groups:
-        for e in group_entries:
-            e["lottery_result"] = "予備当選"
-    for _, group_entries in loser_groups:
-        for e in group_entries:
-            e["lottery_result"] = "落選"
+    for e in winners:
+        e["lottery_result"] = "当選"
+    for e in reserves:
+        e["lottery_result"] = "予備当選"
+    for e in losers:
+        e["lottery_result"] = "落選"
     for e in ineligible_entries:
         if "lottery_result" not in e:
             e["lottery_result"] = "対象外"
 
-    # 全結果を平坦化
-    all_results = []
-    for _, group_entries in winner_groups:
-        all_results.extend(group_entries)
-    for _, group_entries in reserve_groups:
-        all_results.extend(group_entries)
-    for _, group_entries in loser_groups:
-        all_results.extend(group_entries)
-    all_results.extend(ineligible_entries)
+    all_results = winners + reserves + losers + ineligible_entries
 
     # 結果保存
     if getattr(args, "local", False) or not hasattr(args, "campaign"):
@@ -411,26 +511,21 @@ def cmd_lottery(args):
                     {
                         "lottery_result": entry.get("lottery_result", ""),
                         "aggregated_cp_total": entry.get("aggregated_cp_total"),
-                        "receipt_count": entry.get("receipt_count"),
                     }
                 )
         # ローカルにもJSON出力
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
-        # _id を除去してJSON保存
         clean = [{k: v for k, v in e.items() if k != "_id"} for e in all_results]
         output.write_text(
             json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"Firestore更新完了 + ローカル保存: {output}")
 
-    eligible_count = len(eligible_groups)
     print(f"\n=== 抽選結果: {prize['name']} ===")
-    print(f"応募総数: {len(entries)}件（{len(groups)}人）")
-    if multi_receipt_count > 0:
-        print(f"  うち複数レシート: {multi_receipt_count}組")
-    print(f"資格あり: {eligible_count}人")
-    print(f"当選: {len(winner_groups)} / 予備: {len(reserve_groups)} / 落選: {len(loser_groups)}")
+    print(f"応募総数: {len(entries)}件")
+    print(f"資格あり: {len(eligible_entries)}人")
+    print(f"当選: {len(winners)} / 予備: {len(reserves)} / 落選: {len(losers)}")
     print(f"対象外: {len(ineligible_entries)}件")
 
 
@@ -446,14 +541,22 @@ def cmd_export(args):
     elif filter_mode == "ineligible":
         entries = [e for e in entries if e.get("lottery_result") == "対象外"]
 
-    # ファイル番号でソート
-    entries.sort(key=lambda e: e.get("file_number", _extract_filename_number(
-        e.get("original_filename", e.get("image_path", ""))
-    )))
+    # ソート: form_id → answer_id or file_number
+    entries.sort(key=lambda e: (
+        e.get("form_id", 0),
+        e.get("answer_id", _extract_filename_number(
+            e.get("original_filename", e.get("image_path", ""))
+        )),
+    ))
 
     rows = []
     for entry in entries:
-        data = _get_entry_data(entry)
+        # 新形式（images配列）の場合は合算データを使用
+        if entry.get("images"):
+            data = _get_entry_data_multi(entry) if not entry.get("human_input_done") else _get_entry_data(entry)
+        else:
+            data = _get_entry_data(entry)
+
         confidence = entry.get("confidence", 0)
         error = entry.get("error")
 
@@ -470,15 +573,28 @@ def cmd_export(args):
         tax_type = data["tax_type"] if data["tax_type"] else ""
         tax_adjusted = "税補正済" if data["tax_adjusted"] else ""
 
-        filename = entry.get("original_filename", Path(entry.get("image_path", "")).name)
+        entry_key = _get_entry_key(entry)
         row = {
-            "画像ファイル名": filename,
+            "エントリID": entry_key,
+            "フォームID": entry.get("form_id", ""),
+            "回答ID": entry.get("answer_id", ""),
+            "姓": entry.get("last_name", ""),
+            "名": entry.get("first_name", ""),
+            "郵便番号": entry.get("postal_code", ""),
+            "都道府県": entry.get("prefecture", ""),
+            "市区町村": entry.get("city", ""),
+            "番地": entry.get("address1", ""),
+            "番地2": entry.get("address2", ""),
+            "ビル名": entry.get("building", ""),
+            "電話番号": entry.get("phone", ""),
+            "メール": entry.get("email", ""),
+            "年齢": entry.get("age", ""),
+            "性別": entry.get("gender", ""),
+            "レシート枚数": entry.get("receipt_count", 1),
             "confidence": conf_str,
             "判定": judgment,
             "税区分": tax_type,
             "税補正": tax_adjusted,
-            "": "",
-            "購入日時": data["purchase_date"],
             "購入チェーン名": data["store_name"],
             "購入店舗": data["store_branch"],
         }
@@ -491,6 +607,8 @@ def cmd_export(args):
             else:
                 row[f"CP対象品{_num_label(i+1)}商品名"] = ""
                 row[f"CP対象品{_num_label(i+1)}金額"] = ""
+
+        row["CP合計"] = data["cp_total"]
 
         kao_items = data["kao_items"]
         for i in range(CSV_COLUMNS["kao_other_max"]):
