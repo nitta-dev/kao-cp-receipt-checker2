@@ -118,9 +118,13 @@ def get_entries(campaign: str, prize: str, order_by: str | None = None) -> list[
         entry["_id"] = doc.id
         entries.append(entry)
 
-    # ソート: form_idがあればform_id→answer_id順、なければfile_number順
+    # ソート: form_id→answer_id→receipt_number順、なければfile_number順
     if entries and "form_id" in entries[0]:
-        entries.sort(key=lambda e: (e.get("form_id", 0), e.get("answer_id", 0)))
+        entries.sort(key=lambda e: (
+            e.get("form_id", 0),
+            e.get("answer_id", 0),
+            e.get("receipt_number", 1),
+        ))
     elif entries and "file_number" in entries[0]:
         entries.sort(key=lambda e: e.get("file_number", 0))
     return entries
@@ -304,7 +308,13 @@ def get_next_unclaimed_entry(
 def get_entry_display_key(entry: dict) -> str:
     """エントリの表示用キーを取得（form_id_answer_id or file_number）"""
     if "form_id" in entry and "answer_id" in entry:
-        return f"{entry['form_id']}_{entry['answer_id']}"
+        base = f"{entry['form_id']}_{entry['answer_id']}"
+        # 複数レシートの場合はレシート番号を付与
+        group_count = entry.get("group_receipt_count", 1)
+        receipt_num = entry.get("receipt_number", 1)
+        if group_count and group_count > 1:
+            return f"{base} (レシート{receipt_num}/{group_count})"
+        return base
     return str(entry.get("file_number", "?"))
 
 

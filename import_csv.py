@@ -185,12 +185,11 @@ def build_entries(
             except (ValueError, TypeError):
                 return None
 
-        entry = {
-            "_id": entry_id,
+        # 応募者共通情報
+        applicant_info = {
             "form_id": form_id,
             "answer_id": answer_id,
             "answered_at": _str(row.get("answered_at")),
-            # 応募者情報
             "last_name": _str(row.get("last_name")),
             "first_name": _str(row.get("first_name")),
             "postal_code": _str(row.get("postal_code")),
@@ -204,18 +203,49 @@ def build_entries(
             "age": _int(row.get("age")),
             "gender": _str(row.get("gender")),
             "q2_course": _str(row.get("q2_course")),
-            # 画像
-            "images": entry_images,
-            "receipt_count": len(entry_images),
-            # ステータス
-            "is_auto": False,
-            "human_input_done": False,
-            "confidence": None,
-            "error": None,
-            "assigned_to": None,
-            "assigned_at": None,
         }
-        entries.append(entry)
+
+        # レシート1枚ごとに1エントリを作成
+        if not entry_images:
+            # 画像なし: 従来通り1エントリ
+            entry = {
+                **applicant_info,
+                "_id": entry_id,
+                "group_id": entry_id,
+                "receipt_number": 1,
+                "group_receipt_count": 0,
+                "images": [],
+                "receipt_count": 0,
+                "is_auto": False,
+                "human_input_done": False,
+                "confidence": None,
+                "error": None,
+                "assigned_to": None,
+                "assigned_at": None,
+            }
+            entries.append(entry)
+        else:
+            for img in entry_images:
+                r_num = img["receipt_number"]
+                receipt_entry_id = f"{entry_id}_r{r_num}" if len(entry_images) > 1 else entry_id
+                entry = {
+                    **applicant_info,
+                    "_id": receipt_entry_id,
+                    "group_id": entry_id,
+                    "receipt_number": r_num,
+                    "group_receipt_count": len(entry_images),
+                    "images": [img],
+                    "receipt_count": 1,
+                    "storage_path": img["storage_path"],
+                    "original_filename": img["original_filename"],
+                    "is_auto": False,
+                    "human_input_done": False,
+                    "confidence": None,
+                    "error": None,
+                    "assigned_to": None,
+                    "assigned_at": None,
+                }
+                entries.append(entry)
 
     print(f"CSV行数: {len(df)}")
     print(f"画像あり: {matched}件, 画像なし: {no_images}件")

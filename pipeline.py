@@ -410,7 +410,7 @@ def _get_entry_data_multi(entry: dict) -> dict:
 
 
 def cmd_lottery(args):
-    """抽選: エントリから賞ごとに当選者を抽出（新形式: 1エントリ=1応募者）"""
+    """抽選: エントリから賞ごとに当選者を抽出（レシート単位→応募者単位で集計）"""
     entries = _load_entries(args)
     prize_id = args.prize
     seed = args.seed
@@ -434,63 +434,71 @@ def cmd_lottery(args):
         sys.exit(1)
 
     random.seed(seed)
-
     prize = PRIZES[prize_id]
 
-    eligible_entries = []
-    ineligible_entries = []
-
+    # group_idで応募者単位にグループ化
+    from collections import defaultdict
+    groups = defaultdict(list)
     for entry in entries:
-        # 読み取り不可チェック
-        if entry.get("unreadable"):
-            entry["lottery_result"] = "対象外"
-            ineligible_entries.append({**entry, "reason": "レシート読み取り不可"})
+        gid = entry.get("group_id", entry.get("_id"))
+        groups[gid].append(entry)
+
+    eligible_groups = []
+    ineligible_groups = []
+
+    for gid, group_entries in groups.items():
+        # 全レシートが読み取り不可なら対象外
+        if all(e.get("unreadable") for e in group_entries):
+            for e in group_entries:
+                e["lottery_result"] = "対象外"
+            ineligible_groups.append((group_entries, "レシート読み取り不可"))
             continue
 
-        # 新形式（images配列）の場合は合算データを使用
-        if entry.get("images"):
-            data = _get_entry_data_multi(entry)
-        else:
-            data = _get_entry_data(entry)
+        # 各レシートのデータを集計
+        total_cp = 0
+        store_groups_list = []
+        for e in group_entries:
+            if e.get("unreadable"):
+                continue
+            data = _get_entry_data(e)
+            total_cp += data["cp_total"]
+            store_groups_list.append(identify_store_group(data["store_name"]))
 
-        cp_total = data["cp_total"]
-        store = data["store_name"]
-        store_groups_list = [identify_store_group(store)]
+        for e in group_entries:
+            e["aggregated_cp_total"] = total_cp
 
-        # 複数レシートの場合、各レシートの店舗も考慮
-        if entry.get("images"):
-            store_groups_list = []
-            for img in entry["images"]:
-                s = img.get("store_name", "")
-                store_groups_list.append(identify_store_group(s))
-
-        entry["aggregated_cp_total"] = cp_total
-
-        ok, reason = check_eligibility_group(cp_total, store_groups_list, prize_id)
+        ok, reason = check_eligibility_group(total_cp, store_groups_list, prize_id)
 
         if ok:
-            eligible_entries.append(entry)
+            eligible_groups.append(group_entries)
         else:
-            ineligible_entries.append({**entry, "reason": reason})
+            ineligible_groups.append((group_entries, reason))
 
-    # --- 抽選 ---
-    random.shuffle(eligible_entries)
+    # --- 抽選（応募者単位） ---
+    random.shuffle(eligible_groups)
 
-    winners = eligible_entries[:prize["winners"]]
-    reserves = eligible_entries[prize["winners"]:prize["winners"] + prize["reserve"]]
-    losers = eligible_entries[prize["winners"] + prize["reserve"]:]
+    winner_groups = eligible_groups[:prize["winners"]]
+    reserve_groups = eligible_groups[prize["winners"]:prize["winners"] + prize["reserve"]]
+    loser_groups = eligible_groups[prize["winners"] + prize["reserve"]:]
 
-    for e in winners:
-        e["lottery_result"] = "当選"
-    for e in reserves:
-        e["lottery_result"] = "予備当選"
-    for e in losers:
-        e["lottery_result"] = "落選"
-    for e in ineligible_entries:
-        if "lottery_result" not in e:
-            e["lottery_result"] = "対象外"
-
-    all_results = winners + reserves + losers + ineligible_entries
+    all_results = []
+    for group in winner_groups:
+        for e in group:
+            e["lottery_result"] = "当選"
+            all_results.append(e)
+    for group in reserve_groups:
+        for e in group:
+            e["lottery_result"] = "予備当選"
+            all_results.append(e)
+    for group in loser_groups:
+        for e in group:
+            e["lottery_result"] = "落選"
+            all_results.append(e)
+    for group, reason in ineligible_groups:
+        for e in group:
+            if "lottery_result" not in e:
+                e["lottery_result"] = "対象外"
+            all_results.append(e)
 
     # 結果保存
     if getattr(args, "local", False) or not hasattr(args, "campaign"):
@@ -522,11 +530,12 @@ def cmd_lottery(args):
         )
         print(f"Firestore更新完了 + ローカル保存: {output}")
 
+    n_applicants = len(groups)
     print(f"\n=== 抽選結果: {prize['name']} ===")
-    print(f"応募総数: {len(entries)}件")
-    print(f"資格あり: {len(eligible_entries)}人")
-    print(f"当選: {len(winners)} / 予備: {len(reserves)} / 落選: {len(losers)}")
-    print(f"対象外: {len(ineligible_entries)}件")
+    print(f"レシート総数: {len(entries)}件 (応募者: {n_applicants}人)")
+    print(f"資格あり: {len(eligible_groups)}人")
+    print(f"当選: {len(winner_groups)} / 予備: {len(reserve_groups)} / 落選: {len(loser_groups)}")
+    print(f"対象外: {len(ineligible_groups)}件")
 
 
 def cmd_export(args):
@@ -552,11 +561,25 @@ def cmd_export(args):
     rows = []
     for entry in entries:
         entry_key = _get_entry_key(entry)
-        images = entry.get("images", [])
+        data = _get_entry_data(entry)
 
-        # 共通の応募者情報
-        base_row = {
+        confidence = entry.get("confidence", 0)
+        error = entry.get("error")
+
+        if error:
+            judgment = "人間入力（エラー）"
+            conf_str = "ERROR"
+        elif entry.get("is_auto"):
+            judgment = "AI自動"
+            conf_str = str(confidence)
+        else:
+            judgment = "人間入力"
+            conf_str = str(confidence)
+
+        row = {
             "エントリID": entry_key,
+            "グループID": entry.get("group_id", entry_key),
+            "レシート番号": entry.get("receipt_number", 1),
             "フォームID": entry.get("form_id", ""),
             "回答ID": entry.get("answer_id", ""),
             "姓": entry.get("last_name", ""),
@@ -571,108 +594,46 @@ def cmd_export(args):
             "メール": entry.get("email", ""),
             "年齢": entry.get("age", ""),
             "性別": entry.get("gender", ""),
-            "レシート枚数": entry.get("receipt_count", 1),
+            "グループレシート枚数": entry.get("group_receipt_count", 1),
             "lottery_result": entry.get("lottery_result", ""),
+            "confidence": conf_str,
+            "判定": judgment,
+            "税区分": data["tax_type"] if data["tax_type"] else "",
+            "税補正": "税補正済" if data["tax_adjusted"] else "",
+            "購入チェーン名": data["store_name"],
+            "購入店舗": data["store_branch"],
         }
 
-        # 新形式: 各画像を別行に展開
-        ocr_images = [img for img in images if img.get("ocr_done")]
-        if ocr_images and not entry.get("human_input_done"):
-            for img in ocr_images:
-                row = dict(base_row)
-                row["レシート番号"] = img.get("receipt_number", "")
-                row["confidence"] = img.get("confidence", "")
-                row["判定"] = "AI自動" if img.get("is_auto") else "人間入力"
-                row["税区分"] = img.get("tax_type", "")
-                row["税補正"] = "税補正済" if img.get("tax_adjusted") else ""
-                row["購入チェーン名"] = img.get("store_name", "")
-                row["購入店舗"] = img.get("store_branch", "")
-
-                cp_items = [i for i in img.get("items", []) if i.get("is_cp_target")]
-                for i in range(CSV_COLUMNS["cp_target_max"]):
-                    if i < len(cp_items):
-                        row[f"CP対象品{_num_label(i+1)}商品名"] = cp_items[i].get("name", "")
-                        row[f"CP対象品{_num_label(i+1)}金額"] = cp_items[i].get("price", "")
-                    else:
-                        row[f"CP対象品{_num_label(i+1)}商品名"] = ""
-                        row[f"CP対象品{_num_label(i+1)}金額"] = ""
-
-                row["CP合計"] = img.get("cp_target_total", 0)
-
-                kao_items = [i for i in img.get("items", []) if i.get("is_kao") and not i.get("is_cp_target")]
-                for i in range(CSV_COLUMNS["kao_other_max"]):
-                    if i < len(kao_items):
-                        row[f"その他花王{_num_label(i+1)}商品名"] = kao_items[i].get("name", "")
-                        row[f"その他花王{_num_label(i+1)}金額"] = kao_items[i].get("price", "")
-                    else:
-                        row[f"その他花王{_num_label(i+1)}商品名"] = ""
-                        row[f"その他花王{_num_label(i+1)}金額"] = ""
-
-                unknown_items = []
-                for i in range(CSV_COLUMNS["unknown_kao_max"]):
-                    row[f"判断つかず{_num_label(i+1)}商品名"] = ""
-                    row[f"判断つかず{_num_label(i+1)}金額"] = ""
-
-                rows.append(row)
-        else:
-            # 旧形式 or 人間入力済み: 1エントリ=1行
-            if entry.get("images") and not entry.get("human_input_done"):
-                data = _get_entry_data_multi(entry)
+        cp_items = data["cp_items"]
+        for i in range(CSV_COLUMNS["cp_target_max"]):
+            if i < len(cp_items):
+                row[f"CP対象品{_num_label(i+1)}商品名"] = cp_items[i].get("name", "")
+                row[f"CP対象品{_num_label(i+1)}金額"] = cp_items[i].get("price", "")
             else:
-                data = _get_entry_data(entry)
+                row[f"CP対象品{_num_label(i+1)}商品名"] = ""
+                row[f"CP対象品{_num_label(i+1)}金額"] = ""
 
-            confidence = entry.get("confidence", 0)
-            error = entry.get("error")
+        row["CP合計"] = data["cp_total"]
 
-            if error:
-                judgment = "人間入力（エラー）"
-                conf_str = "ERROR"
-            elif entry.get("is_auto"):
-                judgment = "AI自動"
-                conf_str = str(confidence)
+        kao_items = data["kao_items"]
+        for i in range(CSV_COLUMNS["kao_other_max"]):
+            if i < len(kao_items):
+                row[f"その他花王{_num_label(i+1)}商品名"] = kao_items[i].get("name", "")
+                row[f"その他花王{_num_label(i+1)}金額"] = kao_items[i].get("price", "")
             else:
-                judgment = "人間入力"
-                conf_str = str(confidence)
+                row[f"その他花王{_num_label(i+1)}商品名"] = ""
+                row[f"その他花王{_num_label(i+1)}金額"] = ""
 
-            row = dict(base_row)
-            row["レシート番号"] = ""
-            row["confidence"] = conf_str
-            row["判定"] = judgment
-            row["税区分"] = data["tax_type"] if data["tax_type"] else ""
-            row["税補正"] = "税補正済" if data["tax_adjusted"] else ""
-            row["購入チェーン名"] = data["store_name"]
-            row["購入店舗"] = data["store_branch"]
+        unknown_items = data["unknown_items"]
+        for i in range(CSV_COLUMNS["unknown_kao_max"]):
+            if i < len(unknown_items):
+                row[f"判断つかず{_num_label(i+1)}商品名"] = unknown_items[i].get("name", "")
+                row[f"判断つかず{_num_label(i+1)}金額"] = unknown_items[i].get("price", "")
+            else:
+                row[f"判断つかず{_num_label(i+1)}商品名"] = ""
+                row[f"判断つかず{_num_label(i+1)}金額"] = ""
 
-            cp_items = data["cp_items"]
-            for i in range(CSV_COLUMNS["cp_target_max"]):
-                if i < len(cp_items):
-                    row[f"CP対象品{_num_label(i+1)}商品名"] = cp_items[i].get("name", "")
-                    row[f"CP対象品{_num_label(i+1)}金額"] = cp_items[i].get("price", "")
-                else:
-                    row[f"CP対象品{_num_label(i+1)}商品名"] = ""
-                    row[f"CP対象品{_num_label(i+1)}金額"] = ""
-
-            row["CP合計"] = data["cp_total"]
-
-            kao_items = data["kao_items"]
-            for i in range(CSV_COLUMNS["kao_other_max"]):
-                if i < len(kao_items):
-                    row[f"その他花王{_num_label(i+1)}商品名"] = kao_items[i].get("name", "")
-                    row[f"その他花王{_num_label(i+1)}金額"] = kao_items[i].get("price", "")
-                else:
-                    row[f"その他花王{_num_label(i+1)}商品名"] = ""
-                    row[f"その他花王{_num_label(i+1)}金額"] = ""
-
-            unknown_items = data["unknown_items"]
-            for i in range(CSV_COLUMNS["unknown_kao_max"]):
-                if i < len(unknown_items):
-                    row[f"判断つかず{_num_label(i+1)}商品名"] = unknown_items[i].get("name", "")
-                    row[f"判断つかず{_num_label(i+1)}金額"] = unknown_items[i].get("price", "")
-                else:
-                    row[f"判断つかず{_num_label(i+1)}商品名"] = ""
-                    row[f"判断つかず{_num_label(i+1)}金額"] = ""
-
-            rows.append(row)
+        rows.append(row)
 
     df = pd.DataFrame(rows)
     output = Path(args.output)
