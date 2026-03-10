@@ -222,6 +222,7 @@ def _render_entry_form(entry: dict, entry_id: str, key_prefix: str = "") -> dict
         purchase_time_val = st.time_input(
             "🕐 時刻",
             value=existing_time_val,
+            step=60,
             key=f"{p}purchase_time_{entry_id}",
         )
 
