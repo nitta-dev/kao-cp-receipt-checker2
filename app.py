@@ -701,24 +701,28 @@ def page_receipt_input(campaign: str, prize_id: str, user: str):
         else:
             needs_input.append(e)
 
-    # フィルタタブ
-    tab_input, tab_auto, tab_done, tab_all = st.tabs([
+    # フィルタ切替（タブの代わりにradioで排他描画）
+    view_options = [
         f"要手入力 ({len(needs_input)})",
         f"自動確定 ({len(auto_confirmed)})",
         f"入力済み ({len(human_done)})",
         f"全件 ({len(entries)})",
-    ])
+    ]
+    selected_view = st.radio(
+        "表示切替",
+        view_options,
+        horizontal=True,
+        key="receipt_view_mode",
+        label_visibility="collapsed",
+    )
 
-    with tab_input:
+    if selected_view == view_options[0]:
         _render_needs_input(campaign, prize_id, user, needs_input, len(human_done))
-
-    with tab_auto:
+    elif selected_view == view_options[1]:
         _render_auto_confirmed(auto_confirmed, campaign, prize_id, user)
-
-    with tab_done:
+    elif selected_view == view_options[2]:
         _render_human_done(campaign, prize_id, human_done, user)
-
-    with tab_all:
+    elif selected_view == view_options[3]:
         _render_all_entries(entries)
 
 
