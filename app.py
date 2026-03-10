@@ -826,37 +826,71 @@ def _render_needs_input(
         st.subheader("📝 データ入力")
 
         # OCR結果を参考表示（折りたたみ）
-        if current.get("items") and not current.get("error"):
+        has_ocr = current.get("items") or any(
+            img.get("ocr_done") for img in current.get("images", [])
+        )
+        if has_ocr and not current.get("error"):
             with st.expander("🤖 AI読み取り結果（参考）"):
                 st.caption("⚠️ 信頼度が低いため人間確認が必要です。参考としてご利用ください。")
-                if current.get("store_name"):
-                    st.markdown(f"**店舗**: {current.get('store_name', '')} {current.get('store_branch', '')}")
-                if current.get("purchase_date"):
-                    st.markdown(f"**日時**: {current.get('purchase_date', '')}")
 
-                items = current.get("items", [])
-                cp_items_ref = [i for i in items if i.get("is_cp_target")]
-                kao_items_ref = [i for i in items if i.get("is_kao") and not i.get("is_cp_target")]
-                other_items_ref = [i for i in items if not i.get("is_kao") and i.get("price", 0) > 0]
+                images = current.get("images", [])
+                ocr_images = [img for img in images if img.get("ocr_done")]
 
-                if cp_items_ref:
-                    st.markdown("**🎯 CP対象品（AI判定）:**")
-                    for item in cp_items_ref:
-                        st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                if ocr_images:
+                    # 新形式: images配列からOCR結果を表示
+                    for img in ocr_images:
+                        if len(ocr_images) > 1:
+                            st.markdown(f"**--- レシート {img.get('receipt_number', '?')}枚目 ---**")
+                        if img.get("store_name"):
+                            st.markdown(f"**店舗**: {img.get('store_name', '')} {img.get('store_branch', '')}")
+                        if img.get("purchase_date"):
+                            st.markdown(f"**日時**: {img.get('purchase_date', '')}")
 
-                if kao_items_ref:
-                    st.markdown("**🔵 その他花王（AI判定）:**")
-                    for item in kao_items_ref:
-                        st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                        items = img.get("items", [])
+                        cp_items_ref = [i for i in items if i.get("is_cp_target")]
+                        kao_items_ref = [i for i in items if i.get("is_kao") and not i.get("is_cp_target")]
 
-                if other_items_ref:
-                    st.markdown("**📦 その他商品:**")
-                    for item in other_items_ref[:5]:
-                        st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
-                    if len(other_items_ref) > 5:
-                        st.caption(f"  ...他{len(other_items_ref) - 5}件")
+                        if cp_items_ref:
+                            st.markdown("**🎯 CP対象品（AI判定）:**")
+                            for item in cp_items_ref:
+                                st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
 
-                st.markdown(f"**合計**: ¥{current.get('total', 0):,}")
+                        if kao_items_ref:
+                            st.markdown("**🔵 その他花王（AI判定）:**")
+                            for item in kao_items_ref:
+                                st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+
+                        st.markdown(f"**合計**: ¥{img.get('total', 0):,}")
+                else:
+                    # 旧形式
+                    if current.get("store_name"):
+                        st.markdown(f"**店舗**: {current.get('store_name', '')} {current.get('store_branch', '')}")
+                    if current.get("purchase_date"):
+                        st.markdown(f"**日時**: {current.get('purchase_date', '')}")
+
+                    items = current.get("items", [])
+                    cp_items_ref = [i for i in items if i.get("is_cp_target")]
+                    kao_items_ref = [i for i in items if i.get("is_kao") and not i.get("is_cp_target")]
+                    other_items_ref = [i for i in items if not i.get("is_kao") and i.get("price", 0) > 0]
+
+                    if cp_items_ref:
+                        st.markdown("**🎯 CP対象品（AI判定）:**")
+                        for item in cp_items_ref:
+                            st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+
+                    if kao_items_ref:
+                        st.markdown("**🔵 その他花王（AI判定）:**")
+                        for item in kao_items_ref:
+                            st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+
+                    if other_items_ref:
+                        st.markdown("**📦 その他商品:**")
+                        for item in other_items_ref[:5]:
+                            st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                        if len(other_items_ref) > 5:
+                            st.caption(f"  ...他{len(other_items_ref) - 5}件")
+
+                    st.markdown(f"**合計**: ¥{current.get('total', 0):,}")
 
         form_data = _render_entry_form(current, entry_id)
 
@@ -1039,34 +1073,69 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
                 st.session_state[edit_key] = True
                 st.rerun()
 
-            st.markdown(f"**店舗**: {entry.get('store_name', '不明')} {entry.get('store_branch', '')}")
-            st.markdown(f"**日時**: {entry.get('purchase_date', '不明')}")
-            st.markdown(f"**税区分**: {entry.get('tax_type', '不明')}")
-            if entry.get("tax_adjusted"):
-                st.caption("※ 税補正済")
+            # 新形式（images配列）の場合はレシートごとに表示
+            images = entry.get("images", [])
+            if images and images[0].get("ocr_done"):
+                total_cp = 0
+                for img in images:
+                    if len(images) > 1:
+                        st.markdown(f"---\n**レシート {img.get('receipt_number', '?')}枚目**")
+                    st.markdown(f"**店舗**: {img.get('store_name', '不明')} {img.get('store_branch', '')}")
+                    st.markdown(f"**日時**: {img.get('purchase_date', '不明')}")
+                    st.markdown(f"**税区分**: {img.get('tax_type', '不明')}")
+                    if img.get("tax_adjusted"):
+                        st.caption("※ 税補正済")
 
-            st.divider()
+                    cp_items = [i for i in img.get("items", []) if i.get("is_cp_target")]
+                    if cp_items:
+                        st.markdown("**🎯 CP対象品:**")
+                        for i in cp_items:
+                            st.markdown(f"  - {i.get('name', '?')}  ¥{i.get('price', 0):,}")
+                        img_cp = img.get("cp_target_total", 0)
+                        st.markdown(f"  **CP小計: ¥{img_cp:,}**")
+                        total_cp += img_cp
+                    else:
+                        st.markdown("**🎯 CP対象品:** （なし）")
 
-            cp_items = [item for item in entry.get("items", []) if item.get("is_cp_target")]
-            if cp_items:
-                st.markdown("**🎯 CP対象品:**")
-                for item in cp_items:
-                    price = item.get("price", 0)
-                    st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
-                cp_total = entry.get("cp_target_total", 0)
-                st.markdown(f"  **CP合計: ¥{cp_total:,}**")
+                    kao_items = [i for i in img.get("items", []) if i.get("is_kao") and not i.get("is_cp_target")]
+                    if kao_items:
+                        st.markdown("**🔵 その他花王製品:**")
+                        for i in kao_items:
+                            st.markdown(f"  - {i.get('name', '?')}  ¥{i.get('price', 0):,}")
+
+                if len(images) > 1:
+                    st.divider()
+                    st.markdown(f"**CP合計（全レシート）: ¥{total_cp:,}**")
             else:
-                st.markdown("**🎯 CP対象品:** （なし）")
+                # 旧形式 or OCR未実行
+                st.markdown(f"**店舗**: {entry.get('store_name', '不明')} {entry.get('store_branch', '')}")
+                st.markdown(f"**日時**: {entry.get('purchase_date', '不明')}")
+                st.markdown(f"**税区分**: {entry.get('tax_type', '不明')}")
+                if entry.get("tax_adjusted"):
+                    st.caption("※ 税補正済")
 
-            kao_items = [
-                item for item in entry.get("items", [])
-                if item.get("is_kao") and not item.get("is_cp_target")
-            ]
-            if kao_items:
-                st.markdown("**🔵 その他花王製品:**")
-                for item in kao_items:
-                    price = item.get("price", 0)
-                    st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+                st.divider()
+
+                cp_items = [item for item in entry.get("items", []) if item.get("is_cp_target")]
+                if cp_items:
+                    st.markdown("**🎯 CP対象品:**")
+                    for item in cp_items:
+                        price = item.get("price", 0)
+                        st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
+                    cp_total = entry.get("cp_target_total", 0)
+                    st.markdown(f"  **CP合計: ¥{cp_total:,}**")
+                else:
+                    st.markdown("**🎯 CP対象品:** （なし）")
+
+                kao_items = [
+                    item for item in entry.get("items", [])
+                    if item.get("is_kao") and not item.get("is_cp_target")
+                ]
+                if kao_items:
+                    st.markdown("**🔵 その他花王製品:**")
+                    for item in kao_items:
+                        price = item.get("price", 0)
+                        st.markdown(f"  - {item.get('name', '?')}  ¥{price:,}")
 
             st.divider()
             eligibility = get_eligibility_display(entry.get("cp_target_total", 0))

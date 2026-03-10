@@ -551,30 +551,11 @@ def cmd_export(args):
 
     rows = []
     for entry in entries:
-        # 新形式（images配列）の場合は合算データを使用
-        if entry.get("images"):
-            data = _get_entry_data_multi(entry) if not entry.get("human_input_done") else _get_entry_data(entry)
-        else:
-            data = _get_entry_data(entry)
-
-        confidence = entry.get("confidence", 0)
-        error = entry.get("error")
-
-        if error:
-            judgment = "人間入力（エラー）"
-            conf_str = "ERROR"
-        elif entry.get("is_auto"):
-            judgment = "AI自動"
-            conf_str = str(confidence)
-        else:
-            judgment = "人間入力"
-            conf_str = str(confidence)
-
-        tax_type = data["tax_type"] if data["tax_type"] else ""
-        tax_adjusted = "税補正済" if data["tax_adjusted"] else ""
-
         entry_key = _get_entry_key(entry)
-        row = {
+        images = entry.get("images", [])
+
+        # 共通の応募者情報
+        base_row = {
             "エントリID": entry_key,
             "フォームID": entry.get("form_id", ""),
             "回答ID": entry.get("answer_id", ""),
@@ -591,46 +572,107 @@ def cmd_export(args):
             "年齢": entry.get("age", ""),
             "性別": entry.get("gender", ""),
             "レシート枚数": entry.get("receipt_count", 1),
-            "confidence": conf_str,
-            "判定": judgment,
-            "税区分": tax_type,
-            "税補正": tax_adjusted,
-            "購入チェーン名": data["store_name"],
-            "購入店舗": data["store_branch"],
+            "lottery_result": entry.get("lottery_result", ""),
         }
 
-        cp_items = data["cp_items"]
-        for i in range(CSV_COLUMNS["cp_target_max"]):
-            if i < len(cp_items):
-                row[f"CP対象品{_num_label(i+1)}商品名"] = cp_items[i].get("name", "")
-                row[f"CP対象品{_num_label(i+1)}金額"] = cp_items[i].get("price", "")
+        # 新形式: 各画像を別行に展開
+        ocr_images = [img for img in images if img.get("ocr_done")]
+        if ocr_images and not entry.get("human_input_done"):
+            for img in ocr_images:
+                row = dict(base_row)
+                row["レシート番号"] = img.get("receipt_number", "")
+                row["confidence"] = img.get("confidence", "")
+                row["判定"] = "AI自動" if img.get("is_auto") else "人間入力"
+                row["税区分"] = img.get("tax_type", "")
+                row["税補正"] = "税補正済" if img.get("tax_adjusted") else ""
+                row["購入チェーン名"] = img.get("store_name", "")
+                row["購入店舗"] = img.get("store_branch", "")
+
+                cp_items = [i for i in img.get("items", []) if i.get("is_cp_target")]
+                for i in range(CSV_COLUMNS["cp_target_max"]):
+                    if i < len(cp_items):
+                        row[f"CP対象品{_num_label(i+1)}商品名"] = cp_items[i].get("name", "")
+                        row[f"CP対象品{_num_label(i+1)}金額"] = cp_items[i].get("price", "")
+                    else:
+                        row[f"CP対象品{_num_label(i+1)}商品名"] = ""
+                        row[f"CP対象品{_num_label(i+1)}金額"] = ""
+
+                row["CP合計"] = img.get("cp_target_total", 0)
+
+                kao_items = [i for i in img.get("items", []) if i.get("is_kao") and not i.get("is_cp_target")]
+                for i in range(CSV_COLUMNS["kao_other_max"]):
+                    if i < len(kao_items):
+                        row[f"その他花王{_num_label(i+1)}商品名"] = kao_items[i].get("name", "")
+                        row[f"その他花王{_num_label(i+1)}金額"] = kao_items[i].get("price", "")
+                    else:
+                        row[f"その他花王{_num_label(i+1)}商品名"] = ""
+                        row[f"その他花王{_num_label(i+1)}金額"] = ""
+
+                unknown_items = []
+                for i in range(CSV_COLUMNS["unknown_kao_max"]):
+                    row[f"判断つかず{_num_label(i+1)}商品名"] = ""
+                    row[f"判断つかず{_num_label(i+1)}金額"] = ""
+
+                rows.append(row)
+        else:
+            # 旧形式 or 人間入力済み: 1エントリ=1行
+            if entry.get("images") and not entry.get("human_input_done"):
+                data = _get_entry_data_multi(entry)
             else:
-                row[f"CP対象品{_num_label(i+1)}商品名"] = ""
-                row[f"CP対象品{_num_label(i+1)}金額"] = ""
+                data = _get_entry_data(entry)
 
-        row["CP合計"] = data["cp_total"]
+            confidence = entry.get("confidence", 0)
+            error = entry.get("error")
 
-        kao_items = data["kao_items"]
-        for i in range(CSV_COLUMNS["kao_other_max"]):
-            if i < len(kao_items):
-                row[f"その他花王{_num_label(i+1)}商品名"] = kao_items[i].get("name", "")
-                row[f"その他花王{_num_label(i+1)}金額"] = kao_items[i].get("price", "")
+            if error:
+                judgment = "人間入力（エラー）"
+                conf_str = "ERROR"
+            elif entry.get("is_auto"):
+                judgment = "AI自動"
+                conf_str = str(confidence)
             else:
-                row[f"その他花王{_num_label(i+1)}商品名"] = ""
-                row[f"その他花王{_num_label(i+1)}金額"] = ""
+                judgment = "人間入力"
+                conf_str = str(confidence)
 
-        unknown_items = data["unknown_items"]
-        for i in range(CSV_COLUMNS["unknown_kao_max"]):
-            if i < len(unknown_items):
-                row[f"判断つかず{_num_label(i+1)}商品名"] = unknown_items[i].get("name", "")
-                row[f"判断つかず{_num_label(i+1)}金額"] = unknown_items[i].get("price", "")
-            else:
-                row[f"判断つかず{_num_label(i+1)}商品名"] = ""
-                row[f"判断つかず{_num_label(i+1)}金額"] = ""
+            row = dict(base_row)
+            row["レシート番号"] = ""
+            row["confidence"] = conf_str
+            row["判定"] = judgment
+            row["税区分"] = data["tax_type"] if data["tax_type"] else ""
+            row["税補正"] = "税補正済" if data["tax_adjusted"] else ""
+            row["購入チェーン名"] = data["store_name"]
+            row["購入店舗"] = data["store_branch"]
 
-        row["lottery_result"] = entry.get("lottery_result", "")
+            cp_items = data["cp_items"]
+            for i in range(CSV_COLUMNS["cp_target_max"]):
+                if i < len(cp_items):
+                    row[f"CP対象品{_num_label(i+1)}商品名"] = cp_items[i].get("name", "")
+                    row[f"CP対象品{_num_label(i+1)}金額"] = cp_items[i].get("price", "")
+                else:
+                    row[f"CP対象品{_num_label(i+1)}商品名"] = ""
+                    row[f"CP対象品{_num_label(i+1)}金額"] = ""
 
-        rows.append(row)
+            row["CP合計"] = data["cp_total"]
+
+            kao_items = data["kao_items"]
+            for i in range(CSV_COLUMNS["kao_other_max"]):
+                if i < len(kao_items):
+                    row[f"その他花王{_num_label(i+1)}商品名"] = kao_items[i].get("name", "")
+                    row[f"その他花王{_num_label(i+1)}金額"] = kao_items[i].get("price", "")
+                else:
+                    row[f"その他花王{_num_label(i+1)}商品名"] = ""
+                    row[f"その他花王{_num_label(i+1)}金額"] = ""
+
+            unknown_items = data["unknown_items"]
+            for i in range(CSV_COLUMNS["unknown_kao_max"]):
+                if i < len(unknown_items):
+                    row[f"判断つかず{_num_label(i+1)}商品名"] = unknown_items[i].get("name", "")
+                    row[f"判断つかず{_num_label(i+1)}金額"] = unknown_items[i].get("price", "")
+                else:
+                    row[f"判断つかず{_num_label(i+1)}商品名"] = ""
+                    row[f"判断つかず{_num_label(i+1)}金額"] = ""
+
+            rows.append(row)
 
     df = pd.DataFrame(rows)
     output = Path(args.output)
