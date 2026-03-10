@@ -472,15 +472,26 @@ def main():
     # 担当者選択（変更時にエントリを切り替え）
     def _on_user_change():
         """担当者変更時に現在のエントリをクリアして再取得させる"""
+        st.session_state["selected_user"] = st.session_state["current_user"]
         st.session_state.pop("current_entry", None)
         st.cache_data.clear()
+
+    # 前回選択した担当者を復元
+    saved_user = st.session_state.get("selected_user", None)
+    default_idx = 0
+    if saved_user and saved_user in members:
+        default_idx = members.index(saved_user)
 
     user = st.sidebar.selectbox(
         "👤 担当者",
         members,
+        index=default_idx,
         key="current_user",
         on_change=_on_user_change,
     )
+    # 初回選択時も保存
+    if "selected_user" not in st.session_state:
+        st.session_state["selected_user"] = user
 
     # メンバー管理
     with st.sidebar.expander("👥 メンバー管理"):
