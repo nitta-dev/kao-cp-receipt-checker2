@@ -23,5 +23,5 @@ Thumbs.db
 # Results (local only)
 results/
 
-# Images (local only, uploaded to Firebase Storage)
-data/receipt_images/
+# Data (CSV + images, local only)
+data/
