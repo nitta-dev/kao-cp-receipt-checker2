@@ -8,7 +8,15 @@ Usage:
     python migrate_split_receipts.py --campaign kao_cp_2026 --prize A
 """
 import argparse
+import os
 import sys
+
+# Windows cp932 対策
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+if sys.stdout.encoding != "utf-8":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from config import DEFAULT_CAMPAIGN_ID, PRIZES
 from firebase_client import init_firebase, get_entries, update_entry, _entries_ref, _db
