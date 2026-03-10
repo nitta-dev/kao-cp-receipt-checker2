@@ -180,6 +180,16 @@ def get_entry_label(entry: dict) -> str:
 
 
 # ============================================================
+def _safe_int(val, default=0) -> int:
+    """Firestore値を安全にintに変換（文字列・None対応）"""
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 # 共通: 入力フォーム描画 & 保存処理
 # ============================================================
 def _render_entry_form(entry: dict, entry_id: str, key_prefix: str = "") -> dict:
@@ -930,14 +940,14 @@ def _render_needs_input(
                         if cp_items_ref:
                             st.markdown("**🎯 CP対象品（AI判定）:**")
                             for item in cp_items_ref:
-                                st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                                st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
 
                         if kao_items_ref:
                             st.markdown("**🔵 その他花王（AI判定）:**")
                             for item in kao_items_ref:
-                                st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                                st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
 
-                        st.markdown(f"**合計**: ¥{img.get('total', 0):,}")
+                        st.markdown(f"**合計**: ¥{_safe_int(img.get('total', 0)):,}")
                 else:
                     # 旧形式
                     if current.get("store_name"):
@@ -953,21 +963,21 @@ def _render_needs_input(
                     if cp_items_ref:
                         st.markdown("**🎯 CP対象品（AI判定）:**")
                         for item in cp_items_ref:
-                            st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                            st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
 
                     if kao_items_ref:
                         st.markdown("**🔵 その他花王（AI判定）:**")
                         for item in kao_items_ref:
-                            st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                            st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
 
                     if other_items_ref:
                         st.markdown("**📦 その他商品:**")
                         for item in other_items_ref[:5]:
-                            st.markdown(f"  - {item.get('name', '?')}  ¥{item.get('price', 0):,}")
+                            st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
                         if len(other_items_ref) > 5:
                             st.caption(f"  ...他{len(other_items_ref) - 5}件")
 
-                    st.markdown(f"**合計**: ¥{current.get('total', 0):,}")
+                    st.markdown(f"**合計**: ¥{_safe_int(current.get('total', 0)):,}")
 
         form_data = _render_entry_form(current, entry_id)
 
@@ -1181,7 +1191,7 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
                     if cp_items:
                         st.markdown("**🎯 CP対象品:**")
                         for i in cp_items:
-                            st.markdown(f"  - {i.get('name', '?')}  ¥{i.get('price', 0):,}")
+                            st.markdown(f"  - {i.get('name', '?')}  ¥{_safe_int(i.get('price', 0)):,}")
                         img_cp = img.get("cp_target_total", 0)
                         st.markdown(f"  **CP小計: ¥{img_cp:,}**")
                         total_cp += img_cp
@@ -1192,7 +1202,7 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
                     if kao_items:
                         st.markdown("**🔵 その他花王製品:**")
                         for i in kao_items:
-                            st.markdown(f"  - {i.get('name', '?')}  ¥{i.get('price', 0):,}")
+                            st.markdown(f"  - {i.get('name', '?')}  ¥{_safe_int(i.get('price', 0)):,}")
 
                 if len(images) > 1:
                     st.divider()
