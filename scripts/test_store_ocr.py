@@ -1,11 +1,16 @@
 """店舗名OCR改善テスト: Entry 1（マツキヨ法典駅前）と21536_300（ドンキ誤読み）を再OCR"""
 import os
 import sys
+from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+# scriptsフォルダから実行するためのパス追加
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 os.environ.setdefault(
     "FIREBASE_CREDENTIALS",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secrets", "serviceAccountKey.json"),
+    os.path.join(str(Path(__file__).resolve().parent.parent), ".secrets", "serviceAccountKey.json"),
 )
 
 from firebase_client import init_firebase, get_entries, download_image_bytes

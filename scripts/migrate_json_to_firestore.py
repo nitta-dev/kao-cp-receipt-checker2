@@ -8,6 +8,9 @@ import re
 import sys
 from pathlib import Path
 
+# scriptsフォルダから実行するためのパス追加
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from firebase_client import init_firebase, create_entries_batch, upload_image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
