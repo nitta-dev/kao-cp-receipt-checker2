@@ -517,6 +517,12 @@ def main():
     prize = PRIZES[prize_id]
     st.sidebar.caption(f"最低金額: ¥{prize['min_amount']:,}")
 
+    # 賞が変わったらエントリをクリア
+    if prize_id != st.session_state.get("_last_prize_id"):
+        st.session_state["_last_prize_id"] = prize_id
+        st.session_state.pop("current_entry", None)
+        st.cache_data.clear()
+
     # モード切替
     mode = st.sidebar.radio(
         "モード",
