@@ -794,6 +794,106 @@ def _get_cached_entries(campaign: str, prize_id: str) -> list[dict]:
     return get_entries(campaign, prize_id)
 
 
+@st.fragment
+def _render_form_fragment(current: dict, entry_id: str, campaign: str, prize_id: str, user: str):
+    """フォーム入力部分をfragmentとして描画（入力時に画像が再読み込みされない）"""
+    st.subheader("📝 データ入力")
+
+    # OCR結果を参考表示（折りたたみ）
+    has_ocr = current.get("items") or any(
+        img.get("ocr_done") for img in current.get("images", [])
+    )
+    if has_ocr and not current.get("error"):
+        with st.expander("🤖 AI読み取り結果（参考）"):
+            st.caption("⚠️ 信頼度が低いため人間確認が必要です。参考としてご利用ください。")
+
+            # OCR結果はエントリ直下 or images[0] から取得
+            ocr_store = current.get("store_name", "")
+            ocr_branch = current.get("store_branch", "")
+            ocr_date = current.get("purchase_date", "")
+            ocr_items = current.get("items", [])
+            ocr_total = current.get("total", 0)
+
+            images = current.get("images", [])
+            if images and images[0].get("ocr_done"):
+                img = images[0]
+                ocr_store = ocr_store or img.get("store_name", "")
+                ocr_branch = ocr_branch or img.get("store_branch", "")
+                ocr_date = ocr_date or img.get("purchase_date", "")
+                ocr_items = ocr_items or img.get("items", [])
+                ocr_total = ocr_total or img.get("total", 0)
+
+            if ocr_store:
+                st.markdown(f"**店舗**: {ocr_store} {ocr_branch}")
+            if ocr_date:
+                st.markdown(f"**日時**: {ocr_date}")
+
+            cp_items_ref = [i for i in ocr_items if i.get("is_cp_target")]
+            kao_items_ref = [i for i in ocr_items if i.get("is_kao") and not i.get("is_cp_target")]
+
+            if cp_items_ref:
+                st.markdown("**🎯 CP対象品（AI判定）:**")
+                for item in cp_items_ref:
+                    st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
+
+            if kao_items_ref:
+                st.markdown("**🔵 その他花王（AI判定）:**")
+                for item in kao_items_ref:
+                    st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
+
+            st.markdown(f"**合計**: ¥{_safe_int(ocr_total):,}")
+
+    form_data = _render_entry_form(current, entry_id)
+
+    confirm_key = f"confirm_save_{entry_id}"
+
+    if st.button(
+        "💾 保存して次のレシートへ",
+        type="primary",
+        use_container_width=True,
+        key=f"save_{entry_id}",
+    ):
+        st.session_state.pop(confirm_key, None)
+
+        warnings = _get_validation_warnings(form_data)
+        if warnings:
+            st.session_state[confirm_key] = warnings
+            st.rerun(scope="app")
+        else:
+            _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+            st.cache_data.clear()
+            # 次のエントリを取得（今保存したエントリは除外）
+            next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
+            st.session_state["current_entry"] = next_entry
+            st.rerun(scope="app")
+
+    # バリデーション確認ダイアログ
+    if confirm_key in st.session_state:
+        for w in st.session_state[confirm_key]:
+            st.warning(w)
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ はい、このまま保存", key=f"confirm_yes_{entry_id}"):
+                del st.session_state[confirm_key]
+                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+                st.cache_data.clear()
+                next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
+                st.session_state["current_entry"] = next_entry
+                st.rerun(scope="app")
+        with col_no:
+            if st.button("↩ いいえ、戻る", key=f"confirm_no_{entry_id}"):
+                del st.session_state[confirm_key]
+                st.rerun(scope="app")
+
+    # スキップボタン
+    if st.button("⏭ このレシートは後で入力する", key=f"skip_{entry_id}"):
+        release_entry(campaign, prize_id, entry_id)
+        st.cache_data.clear()
+        next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
+        st.session_state["current_entry"] = next_entry
+        st.rerun(scope="app")
+
+
 def _render_needs_input(
     campaign: str, prize_id: str, user: str,
     needs_input: list[dict], done_count: int,
@@ -937,101 +1037,79 @@ def _render_needs_input(
         render_receipt_image(current, st.session_state[rotation_key], zoom)
 
     with col_form:
-        st.subheader("📝 データ入力")
+        _render_form_fragment(current, entry_id, campaign, prize_id, user)
 
-        # OCR結果を参考表示（折りたたみ）
-        has_ocr = current.get("items") or any(
-            img.get("ocr_done") for img in current.get("images", [])
-        )
-        if has_ocr and not current.get("error"):
-            with st.expander("🤖 AI読み取り結果（参考）"):
-                st.caption("⚠️ 信頼度が低いため人間確認が必要です。参考としてご利用ください。")
 
-                # OCR結果はエントリ直下 or images[0] から取得
-                ocr_store = current.get("store_name", "")
-                ocr_branch = current.get("store_branch", "")
-                ocr_date = current.get("purchase_date", "")
-                ocr_items = current.get("items", [])
-                ocr_total = current.get("total", 0)
+@st.fragment
+def _render_auto_edit_fragment(entry: dict, entry_id: str, campaign: str, prize_id: str, user: str, edit_key: str):
+    """自動確定エントリの編集フォーム（fragment）"""
+    st.subheader("✏️ AI自動確定の修正")
+    st.warning("⚠️ AI判定を人間が修正します。保存後は「入力済み」に移動します。")
 
-                images = current.get("images", [])
-                if images and images[0].get("ocr_done"):
-                    img = images[0]
-                    ocr_store = ocr_store or img.get("store_name", "")
-                    ocr_branch = ocr_branch or img.get("store_branch", "")
-                    ocr_date = ocr_date or img.get("purchase_date", "")
-                    ocr_items = ocr_items or img.get("items", [])
-                    ocr_total = ocr_total or img.get("total", 0)
+    edit_entry = dict(entry)
+    if not edit_entry.get("human_store_name"):
+        edit_entry["human_store_name"] = entry.get("store_name", "")
+    if not edit_entry.get("human_store_branch"):
+        edit_entry["human_store_branch"] = entry.get("store_branch", "")
+    if not edit_entry.get("human_purchase_date"):
+        edit_entry["human_purchase_date"] = entry.get("purchase_date", "")
+    if not edit_entry.get("human_cp_items"):
+        edit_entry["human_cp_items"] = [
+            item for item in entry.get("items", []) if item.get("is_cp_target")
+        ]
+    if not edit_entry.get("human_kao_items"):
+        edit_entry["human_kao_items"] = [
+            item for item in entry.get("items", [])
+            if item.get("is_kao") and not item.get("is_cp_target")
+        ]
 
-                if ocr_store:
-                    st.markdown(f"**店舗**: {ocr_store} {ocr_branch}")
-                if ocr_date:
-                    st.markdown(f"**日時**: {ocr_date}")
+    form_data = _render_entry_form(edit_entry, entry_id, key_prefix="autoedit_")
 
-                cp_items_ref = [i for i in ocr_items if i.get("is_cp_target")]
-                kao_items_ref = [i for i in ocr_items if i.get("is_kao") and not i.get("is_cp_target")]
+    edit_confirm_key = f"autoedit_confirm_save_{entry_id}"
 
-                if cp_items_ref:
-                    st.markdown("**🎯 CP対象品（AI判定）:**")
-                    for item in cp_items_ref:
-                        st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
-
-                if kao_items_ref:
-                    st.markdown("**🔵 その他花王（AI判定）:**")
-                    for item in kao_items_ref:
-                        st.markdown(f"  - {item.get('name', '?')}  ¥{_safe_int(item.get('price', 0)):,}")
-
-                st.markdown(f"**合計**: ¥{_safe_int(ocr_total):,}")
-
-        form_data = _render_entry_form(current, entry_id)
-
-        confirm_key = f"confirm_save_{entry_id}"
-
+    col_save, col_cancel = st.columns(2)
+    with col_save:
         if st.button(
-            "💾 保存して次のレシートへ",
+            "💾 保存",
             type="primary",
             use_container_width=True,
-            key=f"save_{entry_id}",
+            key=f"autoedit_save_{entry_id}",
         ):
-            st.session_state.pop(confirm_key, None)
-
+            st.session_state.pop(edit_confirm_key, None)
             warnings = _get_validation_warnings(form_data)
             if warnings:
-                st.session_state[confirm_key] = warnings
-                st.rerun()
+                st.session_state[edit_confirm_key] = warnings
+                st.rerun(scope="app")
             else:
                 _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
                 st.cache_data.clear()
-                # 次のエントリを取得（今保存したエントリは除外）
-                next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
-                st.session_state["current_entry"] = next_entry
-                st.rerun()
+                _cleanup_edit_state(entry_id, edit_key)
+                st.rerun(scope="app")
+    with col_cancel:
+        if st.button(
+            "❌ キャンセル",
+            use_container_width=True,
+            key=f"autoedit_cancel_{entry_id}",
+        ):
+            st.session_state.pop(edit_confirm_key, None)
+            _cleanup_edit_state(entry_id, edit_key)
+            st.rerun(scope="app")
 
-        # バリデーション確認ダイアログ
-        if confirm_key in st.session_state:
-            for w in st.session_state[confirm_key]:
-                st.warning(w)
-            col_yes, col_no = st.columns(2)
-            with col_yes:
-                if st.button("✅ はい、このまま保存", key=f"confirm_yes_{entry_id}"):
-                    del st.session_state[confirm_key]
-                    _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
-                    st.cache_data.clear()
-                    next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
-                    st.session_state["current_entry"] = next_entry
-                    st.rerun()
-            with col_no:
-                if st.button("↩ いいえ、戻る", key=f"confirm_no_{entry_id}"):
-                    del st.session_state[confirm_key]
-                    st.rerun()
-
-        # スキップボタン
-        if st.button("⏭ このレシートは後で入力する", key=f"skip_{entry_id}"):
-            release_entry(campaign, prize_id, entry_id)
-            st.cache_data.clear()
-            next_entry = get_next_unclaimed_entry(campaign, prize_id, user, exclude_id=entry_id)
-            st.session_state["current_entry"] = next_entry
-            st.rerun()
+    if edit_confirm_key in st.session_state:
+        for w in st.session_state[edit_confirm_key]:
+            st.warning(w)
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ はい、このまま保存", key=f"autoedit_confirm_yes_{entry_id}"):
+                del st.session_state[edit_confirm_key]
+                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+                st.cache_data.clear()
+                _cleanup_edit_state(entry_id, edit_key)
+                st.rerun(scope="app")
+        with col_no:
+            if st.button("↩ いいえ、戻る", key=f"autoedit_confirm_no_{entry_id}"):
+                del st.session_state[edit_confirm_key]
+                st.rerun(scope="app")
 
 
 def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: str = "", user: str = ""):
@@ -1098,76 +1176,7 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
 
     with col_data:
         if is_editing:
-            # --- 編集モード ---
-            st.subheader("✏️ AI自動確定の修正")
-            st.warning("⚠️ AI判定を人間が修正します。保存後は「入力済み」に移動します。")
-
-            # OCR結果をプリセットとしてフォーム表示
-            # human_* がまだなければOCR結果をデフォルト値に
-            edit_entry = dict(entry)
-            if not edit_entry.get("human_store_name"):
-                edit_entry["human_store_name"] = entry.get("store_name", "")
-            if not edit_entry.get("human_store_branch"):
-                edit_entry["human_store_branch"] = entry.get("store_branch", "")
-            if not edit_entry.get("human_purchase_date"):
-                edit_entry["human_purchase_date"] = entry.get("purchase_date", "")
-            if not edit_entry.get("human_cp_items"):
-                edit_entry["human_cp_items"] = [
-                    item for item in entry.get("items", []) if item.get("is_cp_target")
-                ]
-            if not edit_entry.get("human_kao_items"):
-                edit_entry["human_kao_items"] = [
-                    item for item in entry.get("items", [])
-                    if item.get("is_kao") and not item.get("is_cp_target")
-                ]
-
-            form_data = _render_entry_form(edit_entry, entry_id, key_prefix="autoedit_")
-
-            edit_confirm_key = f"autoedit_confirm_save_{entry_id}"
-
-            col_save, col_cancel = st.columns(2)
-            with col_save:
-                if st.button(
-                    "💾 保存",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"autoedit_save_{entry_id}",
-                ):
-                    st.session_state.pop(edit_confirm_key, None)
-                    warnings = _get_validation_warnings(form_data)
-                    if warnings:
-                        st.session_state[edit_confirm_key] = warnings
-                        st.rerun()
-                    else:
-                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
-                        st.cache_data.clear()
-                        _cleanup_edit_state(entry_id, edit_key)
-                        st.rerun()
-            with col_cancel:
-                if st.button(
-                    "❌ キャンセル",
-                    use_container_width=True,
-                    key=f"autoedit_cancel_{entry_id}",
-                ):
-                    st.session_state.pop(edit_confirm_key, None)
-                    _cleanup_edit_state(entry_id, edit_key)
-                    st.rerun()
-
-            if edit_confirm_key in st.session_state:
-                for w in st.session_state[edit_confirm_key]:
-                    st.warning(w)
-                col_yes, col_no = st.columns(2)
-                with col_yes:
-                    if st.button("✅ はい、このまま保存", key=f"autoedit_confirm_yes_{entry_id}"):
-                        del st.session_state[edit_confirm_key]
-                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
-                        st.cache_data.clear()
-                        _cleanup_edit_state(entry_id, edit_key)
-                        st.rerun()
-                with col_no:
-                    if st.button("↩ いいえ、戻る", key=f"autoedit_confirm_no_{entry_id}"):
-                        del st.session_state[edit_confirm_key]
-                        st.rerun()
+            _render_auto_edit_fragment(entry, entry_id, campaign, prize_id, user, edit_key)
         else:
             # --- 閲覧モード ---
             st.subheader("📋 AI読み取り結果")
@@ -1247,6 +1256,60 @@ def _render_auto_confirmed(entries: list[dict], campaign: str = "", prize_id: st
             st.info(f"→ {eligibility}")
 
 
+@st.fragment
+def _render_done_edit_fragment(entry: dict, entry_id: str, campaign: str, prize_id: str, user: str, edit_key: str):
+    """入力済みエントリの編集フォーム（fragment）"""
+    st.subheader("✏️ データ編集")
+
+    form_data = _render_entry_form(entry, entry_id, key_prefix="edit_")
+
+    edit_confirm_key = f"edit_confirm_save_{entry_id}"
+
+    col_save, col_cancel = st.columns(2)
+    with col_save:
+        if st.button(
+            "💾 保存",
+            type="primary",
+            use_container_width=True,
+            key=f"edit_save_{entry_id}",
+        ):
+            st.session_state.pop(edit_confirm_key, None)
+            warnings = _get_validation_warnings(form_data)
+            if warnings:
+                st.session_state[edit_confirm_key] = warnings
+                st.rerun(scope="app")
+            else:
+                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+                st.cache_data.clear()
+                _cleanup_edit_state(entry_id, edit_key)
+                st.rerun(scope="app")
+    with col_cancel:
+        if st.button(
+            "❌ キャンセル",
+            use_container_width=True,
+            key=f"edit_cancel_{entry_id}",
+        ):
+            st.session_state.pop(edit_confirm_key, None)
+            _cleanup_edit_state(entry_id, edit_key)
+            st.rerun(scope="app")
+
+    if edit_confirm_key in st.session_state:
+        for w in st.session_state[edit_confirm_key]:
+            st.warning(w)
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ はい、このまま保存", key=f"edit_confirm_yes_{entry_id}"):
+                del st.session_state[edit_confirm_key]
+                _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
+                st.cache_data.clear()
+                _cleanup_edit_state(entry_id, edit_key)
+                st.rerun(scope="app")
+        with col_no:
+            if st.button("↩ いいえ、戻る", key=f"edit_confirm_no_{entry_id}"):
+                del st.session_state[edit_confirm_key]
+                st.rerun(scope="app")
+
+
 def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: str = ""):
     """入力済みエントリの閲覧・編集"""
     if not entries:
@@ -1322,55 +1385,7 @@ def _render_human_done(campaign: str, prize_id: str, entries: list[dict], user: 
 
     with col_data:
         if is_editing:
-            st.subheader("✏️ データ編集")
-
-            form_data = _render_entry_form(entry, entry_id, key_prefix="edit_")
-
-            edit_confirm_key = f"edit_confirm_save_{entry_id}"
-
-            col_save, col_cancel = st.columns(2)
-            with col_save:
-                if st.button(
-                    "💾 保存",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"edit_save_{entry_id}",
-                ):
-                    st.session_state.pop(edit_confirm_key, None)
-                    warnings = _get_validation_warnings(form_data)
-                    if warnings:
-                        st.session_state[edit_confirm_key] = warnings
-                        st.rerun()
-                    else:
-                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
-                        st.cache_data.clear()
-                        _cleanup_edit_state(entry_id, edit_key)
-                        st.rerun()
-            with col_cancel:
-                if st.button(
-                    "❌ キャンセル",
-                    use_container_width=True,
-                    key=f"edit_cancel_{entry_id}",
-                ):
-                    st.session_state.pop(edit_confirm_key, None)
-                    _cleanup_edit_state(entry_id, edit_key)
-                    st.rerun()
-
-            if edit_confirm_key in st.session_state:
-                for w in st.session_state[edit_confirm_key]:
-                    st.warning(w)
-                col_yes, col_no = st.columns(2)
-                with col_yes:
-                    if st.button("✅ はい、このまま保存", key=f"edit_confirm_yes_{entry_id}"):
-                        del st.session_state[edit_confirm_key]
-                        _save_entry_to_firestore(campaign, prize_id, entry_id, form_data, user)
-                        st.cache_data.clear()
-                        _cleanup_edit_state(entry_id, edit_key)
-                        st.rerun()
-                with col_no:
-                    if st.button("↩ いいえ、戻る", key=f"edit_confirm_no_{entry_id}"):
-                        del st.session_state[edit_confirm_key]
-                        st.rerun()
+            _render_done_edit_fragment(entry, entry_id, campaign, prize_id, user, edit_key)
         else:
             st.subheader("📋 入力データ")
 
